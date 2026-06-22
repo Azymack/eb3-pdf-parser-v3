@@ -1,0 +1,129 @@
+"""Page routing — v1 heuristic.
+
+Scores each docling page by keyword/heading matches for the requested category,
+then returns the top-N pages plus page 1 (always included for carrier/plan header).
+
+This is a deliberate first-pass: accuracy data from real documents will drive
+refinement. Keep logic isolated here so it can be swapped without touching the
+rest of the orchestrator.
+"""
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Keywords derived from each category's field list. Longer/more-specific phrases
+# score just as much as short ones — adjust weights below if needed post-benchmarking.
+_CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "dental": [
+        "deductible", "annual maximum", "coinsurance", "in-network", "out-of-network",
+        "cleaning", "cleanings", "exam", "x-ray", "sealant", "filling", "extraction",
+        "root canal", "periodontal", "gum disease", "oral surgery", "crown", "denture",
+        "bridge", "implant", "orthodontia", "orthodontic", "waiting period", "frequency",
+        "preventive", "basic", "major", "carrier", "plan name", "network type",
+    ],
+    "vision": [
+        "eye exam", "vision", "lens", "frame", "contact", "bifocal", "trifocal",
+        "lenticular", "single vision", "in-network", "out-of-network", "allowance",
+        "exam frequency", "lens frequency", "frame frequency", "carrier", "plan name",
+    ],
+    "term_life": [
+        "life insurance", "term life", "accidental death", "dismemberment", "ad&d",
+        "age reduction", "beneficiary", "taxation", "coverage amount", "face amount",
+        "carrier", "plan name",
+    ],
+    "std": [
+        "short-term disability", "std", "weekly benefit", "elimination period",
+        "benefit period", "payment period", "disability definition", "own occupation",
+        "pre-existing", "maternity", "guaranteed insurability", "taxation",
+        "carrier", "plan name",
+    ],
+    "ltd": [
+        "long-term disability", "ltd", "monthly benefit", "elimination period",
+        "benefit period", "payment period", "disability definition", "own occupation",
+        "pre-existing", "guaranteed insurability", "taxation", "carrier", "plan name",
+    ],
+    "accident": [
+        "accident", "accidental", "burn", "coma", "concussion", "dental injury",
+        "dislocation", "fracture", "quadriplegia", "paraplegia", "loss of speech",
+        "loss of hearing", "wellness", "accidental death", "dismemberment",
+        "carrier", "plan name",
+    ],
+    "critical_illness": [
+        "critical illness", "cancer", "carcinoma", "heart attack", "stroke",
+        "organ failure", "major organ", "scheduled benefit", "minimum benefit",
+        "maximum benefit", "guaranteed insurability", "pre-existing", "wellness",
+        "carrier", "plan name",
+    ],
+    "sup_life": [
+        "supplemental life", "employee life", "spouse life", "child life",
+        "accidental death", "dismemberment", "ad&d", "age reduction",
+        "guaranteed insurability", "beneficiary", "taxation", "carrier", "plan name",
+    ],
+    "health": [
+        "deductible", "out-of-pocket", "oop", "coinsurance", "copay",
+        "in-network", "out-of-network", "pcp", "primary care", "specialist",
+        "urgent care", "emergency room", "preventive", "outpatient", "inpatient",
+        "surgery", "newborn", "delivery", "diagnostic", "prescription", "generic",
+        "brand", "mail order", "tier", "network type", "network name",
+        "deductible explanation", "carrier", "plan name",
+    ],
+    "health_3tier": [
+        "deductible", "out-of-pocket", "oop", "coinsurance", "copay",
+        "designated network", "in-network", "out-of-network", "pcp", "primary care",
+        "specialist", "urgent care", "emergency room", "preventive", "outpatient",
+        "inpatient", "surgery", "newborn", "delivery", "diagnostic", "prescription",
+        "generic", "brand", "mail order", "tier", "three tier", "3-tier",
+        "network type", "network name", "deductible explanation", "carrier", "plan name",
+    ],
+}
+
+# Narrative/definitional content often carries explanation fields (e.g. "Deductible
+# Explanation", "Out of Network Explanation") that live outside benefits tables.
+_NARRATIVE_KEYWORDS: list[str] = [
+    "network type", "explanation", "out of network", "in-network", "definition",
+    "means", "refers to", "defined as", "following services", "benefit summary",
+]
+
+
+def select_pages(
+    docling_pages: list[dict[str, Any]],
+    category: str,
+    top_n: int = 5,
+) -> list[int]:
+    """Return 1-based page numbers selected for VLM extraction.
+
+    Selection = top-N pages by keyword score for the category, always including
+    page 1 (carrier/plan header info). Ties broken by page order.
+    """
+    keywords = _CATEGORY_KEYWORDS.get(category, [])
+    scored: list[tuple[int, float]] = []
+
+    for page in docling_pages:
+        page_num: int = page["page_number"]
+        text: str = page.get("markdown", "").lower()
+
+        score = sum(1.0 for kw in keywords if kw in text)
+        score += 0.5 * sum(1.0 for kw in _NARRATIVE_KEYWORDS if kw in text)
+
+        scored.append((page_num, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    selected = [pnum for pnum, _ in scored[:top_n]]
+
+    if 1 not in selected:
+        selected.append(1)
+
+    selected.sort()
+
+    logger.info(
+        "page_router: pages selected",
+        extra={
+            "category": category,
+            "top_n": top_n,
+            "all_scores": [(pnum, round(s, 2)) for pnum, s in scored],
+            "selected": selected,
+        },
+    )
+    return selected
