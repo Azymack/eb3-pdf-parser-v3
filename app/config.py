@@ -5,7 +5,8 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     DOCLING_SERVICE_URL: str = "http://129.212.178.134:8001"
-    # Full proxy URL including credentials if needed: http://user:pass@host:port
+    # Outbound HTTP proxy for docling-service and VLM (orchestrator is not IP-allowlisted).
+    # Full URL including credentials if needed: http://user:pass@host:port
     # Must be supplied at deploy time via .env or secrets manager — never committed.
     DOCLING_PROXY_URL: str | None = None
     # Which docling endpoint to use (/convert or /convert-gpu)
@@ -21,7 +22,7 @@ class Settings(BaseSettings):
     REQUEST_TIMEOUT_SECONDS: int = 45
     MAX_FILE_SIZE_MB: int = 50
 
-    VLM_BASE_URL: str = "http://localhost:8000"
+    VLM_BASE_URL: str = "http://129.212.178.134"
     VLM_MODEL: str = "default-vlm-model"
 
     @property

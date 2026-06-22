@@ -1,4 +1,4 @@
-# eb3-pdf-parser-v2
+# eb3-pdf-parser-v3
 
 Orchestrator service for insurance PDF extraction.  
 Receives a PDF + category, runs it through the full pipeline, and returns structured JSON.
@@ -67,7 +67,7 @@ Copy `.env.example` to `.env` and fill in the required values.
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `DOCLING_PROXY_URL` | *(none)* | **Required at deploy time.** See below. |
+| `DOCLING_PROXY_URL` | *(none)* | **Required at deploy time.** Outbound proxy for docling-service and VLM. See below. |
 | `DOCLING_SERVICE_URL` | `http://129.212.178.134:8001` | |
 | `DOCLING_ENDPOINT` | `/convert-gpu` | Switch to `/convert` for CPU-only |
 | `DOCLING_OCR_MODE` | `auto` | `auto` \| `force` \| `off` |
@@ -81,8 +81,9 @@ Copy `.env.example` to `.env` and fill in the required values.
 
 ## DOCLING_PROXY_URL — deployment requirement
 
-docling-service at `http://129.212.178.134:8001` is behind an IP allowlist.
-This orchestrator is **not** on that allowlist and must connect via an HTTP proxy.
+docling-service at `http://129.212.178.134:8001` is behind an IP allowlist, and the
+VLM server is reached the same way. This orchestrator is **not** on that allowlist and
+must connect to both via an HTTP proxy.
 
 **You must set `DOCLING_PROXY_URL` in the deployment environment** (via `.env`,
 your CI/CD secrets store, or however your team manages secrets).  

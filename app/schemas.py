@@ -42,3 +42,7 @@ class ExtractionResponse(BaseModel):
     pages_used: list[int]
     processing_time_seconds: float
     stage_timings: StageTimings
+
+
+class LlmTestResponse(BaseModel):
+    response: str

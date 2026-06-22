@@ -16,9 +16,10 @@ from .schemas import (
     VALID_CATEGORIES,
     VALID_CATEGORIES_SORTED,
     ExtractionResponse,
+    LlmTestResponse,
     StageTimings,
 )
-from .vlm_client import extract_fields
+from .vlm_client import complete_prompt, extract_fields
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,34 @@ async def extract_json_v2(
         )
 
     return result
+
+
+@app.post("/llm_test", response_model=LlmTestResponse)
+async def llm_test(
+    _token: Annotated[str, Depends(verify_token)],
+    prompt: str = Form(..., description="Prompt to send to the VLM"),
+) -> LlmTestResponse:
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt must not be empty")
+
+    try:
+        content = await complete_prompt(prompt)
+    except httpx.ProxyError:
+        raise HTTPException(status_code=502, detail="Proxy unreachable — cannot reach VLM service")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=502, detail="VLM service unreachable")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"VLM service returned HTTP {exc.response.status_code}",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=f"VLM returned invalid response: {exc}")
+    except Exception:
+        logger.exception("llm_test: unexpected VLM error")
+        raise HTTPException(status_code=502, detail="VLM request failed unexpectedly")
+
+    return LlmTestResponse(response=content)
 
 
 async def _run_pipeline(
@@ -150,6 +179,8 @@ async def _run_pipeline(
             page_markdowns=selected_markdowns,
             page_images=rendered_images,
         )
+    except httpx.ProxyError:
+        raise HTTPException(status_code=502, detail="Proxy unreachable — cannot reach VLM service")
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="VLM service unreachable")
     except httpx.HTTPStatusError as exc:

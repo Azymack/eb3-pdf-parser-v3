@@ -16,6 +16,59 @@ logger = logging.getLogger(__name__)
 _TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=5.0)
 
 
+async def _chat_completion(messages: list[dict], *, extra_body: dict | None = None) -> str:
+    """POST to the VLM chat completions endpoint and return message content."""
+    settings = get_settings()
+    proxy = settings.DOCLING_PROXY_URL
+    endpoint = f"{settings.VLM_BASE_URL}/v1/chat/completions"
+
+    payload: dict[str, Any] = {
+        "model": settings.VLM_MODEL,
+        "messages": messages,
+        "temperature": 0.0,
+    }
+    if extra_body:
+        payload["extra_body"] = extra_body
+
+    try:
+        async with httpx.AsyncClient(proxy=proxy, timeout=_TIMEOUT) as client:
+            response = await client.post(
+                endpoint,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+    except httpx.ProxyError as exc:
+        logger.error("vlm_client: proxy unreachable", extra={"error": str(exc)})
+        raise
+    except httpx.ConnectError as exc:
+        logger.error(
+            "vlm_client: VLM unreachable (two-hop path: proxy→service)",
+            extra={"error": str(exc)},
+        )
+        raise
+
+    if response.status_code != 200:
+        logger.error(
+            "vlm_client: VLM returned error",
+            extra={"status_code": response.status_code, "body_preview": response.text[:500]},
+        )
+        response.raise_for_status()
+
+    try:
+        return response.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"VLM returned unexpected response shape: {exc}") from exc
+
+
+async def complete_prompt(prompt: str) -> str:
+    """Send a plain-text prompt to the VLM and return the model's reply."""
+    logger.info(
+        "vlm_client: llm_test prompt",
+        extra={"via_proxy": get_settings().DOCLING_PROXY_URL is not None},
+    )
+    return await _chat_completion([{"role": "user", "content": prompt}])
+
+
 def _build_extraction_schema(field_names: list[str]) -> dict:
     """JSON Schema passed to vLLM's guided_json parameter.
 
@@ -91,8 +144,10 @@ async def extract_fields(
 ) -> dict[str, Any]:
     """Call the VLM and return {"fields": {...}, "low_confidence_fields": [...]}.
 
+    Routes through DOCLING_PROXY_URL when set (same outbound proxy as docling-service).
     Raises:
-        httpx.ConnectError: VLM service unreachable
+        httpx.ProxyError: proxy is unreachable
+        httpx.ConnectError: proxy reachable but VLM service is not
         httpx.HTTPStatusError: VLM returned non-2xx
         ValueError: response content is not parseable JSON
     """
@@ -100,34 +155,19 @@ async def extract_fields(
     schema = _build_extraction_schema(field_names)
     messages = _build_messages(category, field_names, page_markdowns, page_images)
 
-    payload = {
-        "model": settings.VLM_MODEL,
-        "messages": messages,
-        "temperature": 0.0,
-        "extra_body": {"guided_json": schema},
-    }
-
-    endpoint = f"{settings.VLM_BASE_URL}/v1/chat/completions"
-    logger.info("vlm_client: starting extraction", extra={"category": category, "endpoint": endpoint})
-
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        response = await client.post(
-            endpoint,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
-
-    if response.status_code != 200:
-        logger.error(
-            "vlm_client: VLM returned error",
-            extra={"status_code": response.status_code, "body_preview": response.text[:500]},
-        )
-        response.raise_for_status()
+    logger.info(
+        "vlm_client: starting extraction",
+        extra={
+            "category": category,
+            "endpoint": f"{settings.VLM_BASE_URL}/v1/chat/completions",
+            "via_proxy": settings.DOCLING_PROXY_URL is not None,
+        },
+    )
 
     try:
-        raw_content = response.json()["choices"][0]["message"]["content"]
+        raw_content = await _chat_completion(messages, extra_body={"guided_json": schema})
         result = json.loads(raw_content)
-    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"VLM returned unparseable content: {exc}") from exc
 
     logger.info(
