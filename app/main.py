@@ -4,13 +4,15 @@ import time
 from typing import Annotated
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse
 
 from .auth import verify_token
 from .config import get_settings
 from .docling_client import convert_pdf
 from .image_renderer import render_pages
 from .page_router import select_pages
+from .post_process import apply_post_processing, vlm_field_names
 from .schemas import (
     CATEGORY_FIELDS,
     VALID_CATEGORIES,
@@ -28,7 +30,61 @@ app = FastAPI(title="eb3-pdf-parser-v3", version="2.0.0")
 _PDF_MAGIC = b"%PDF"
 
 
-@app.post("/extract_json_v2", response_model=ExtractionResponse)
+def _nulls_to_empty(fields: dict) -> dict[str, str]:
+    """Coerce all field values to str for API output.
+
+    Rules:
+      - None  → ""  (field not on this plan)
+      - str   → str (pass through, including NOT_FOUND sentinel)
+      - dict  → "Key: Value / Key: Value" (VLM sometimes returns nested objects
+                for fields with multiple sub-types, e.g. Root Canal costs per
+                tooth type; flatten to a readable string rather than crashing)
+      - other → str(v)  (integers, booleans, etc. coerced defensively)
+    """
+    result: dict[str, str] = {}
+    for k, v in fields.items():
+        if v is None:
+            result[k] = ""
+        elif isinstance(v, str):
+            result[k] = v
+        elif isinstance(v, dict):
+            parts = [f"{sk}: {sv}" for sk, sv in v.items() if sv is not None]
+            result[k] = " / ".join(parts)
+        elif isinstance(v, list):
+            result[k] = " / ".join(str(x) for x in v if x is not None)
+        else:
+            result[k] = str(v)
+    return result
+
+
+@app.post(
+    "/extract_json_v2",
+    summary="Extract insurance fields from a PDF",
+    description=(
+        "Extract structured data from an insurance benefit PDF.\n\n"
+        "**Default response** (`include_metadata=false`): the response body is the "
+        "extracted fields object directly — a flat JSON object where every key is a "
+        "field name and every value is a string (empty string when the field is not "
+        "present on the plan).\n\n"
+        "**With `?include_metadata=true`**: the full pipeline response is returned, "
+        "including `fields`, `low_confidence_fields`, `pages_used`, "
+        "`processing_time_seconds`, and `stage_timings`."
+    ),
+    responses={
+        200: {
+            "description": (
+                "Extracted data. Shape depends on `include_metadata`:\n"
+                "- `false` (default): `{\"Field Name\": \"value\", ...}` — flat fields object\n"
+                "- `true`: full metadata wrapper with `fields`, `pages_used`, `stage_timings`, etc."
+            )
+        },
+        400: {"description": "Bad request (invalid category, empty file, non-PDF)"},
+        401: {"description": "Missing or invalid API token"},
+        413: {"description": "File exceeds maximum allowed size"},
+        502: {"description": "Upstream service error (docling or VLM)"},
+        504: {"description": "Pipeline exceeded timeout"},
+    },
+)
 async def extract_json_v2(
     _token: Annotated[str, Depends(verify_token)],
     file: UploadFile = File(..., description="PDF document"),
@@ -36,7 +92,16 @@ async def extract_json_v2(
         ...,
         description=f"Insurance category. Valid values: {', '.join(VALID_CATEGORIES_SORTED)}",
     ),
-) -> ExtractionResponse:
+    include_metadata: bool = Query(
+        default=False,
+        description=(
+            "When true, wrap the response in a metadata envelope containing "
+            "`fields`, `low_confidence_fields`, `pages_used`, "
+            "`processing_time_seconds`, and `stage_timings`. "
+            "Default false returns the fields object directly."
+        ),
+    ),
+):
     settings = get_settings()
 
     if category not in VALID_CATEGORIES:
@@ -79,7 +144,9 @@ async def extract_json_v2(
             detail=f"Processing exceeded the {settings.REQUEST_TIMEOUT_SECONDS}s timeout",
         )
 
-    return result
+    if include_metadata:
+        return JSONResponse(result.model_dump())
+    return JSONResponse(result.fields)
 
 
 @app.post("/llm_test", response_model=LlmTestResponse)
@@ -97,9 +164,10 @@ async def llm_test(
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="VLM service unreachable")
     except httpx.HTTPStatusError as exc:
+        body_preview = exc.response.text[:300].strip()
         raise HTTPException(
             status_code=502,
-            detail=f"VLM service returned HTTP {exc.response.status_code}",
+            detail=f"VLM service returned HTTP {exc.response.status_code}: {body_preview}",
         )
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=f"VLM returned invalid response: {exc}")
@@ -135,7 +203,7 @@ async def _run_pipeline(
         )
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=f"docling-service returned invalid response: {exc}")
-    except Exception as exc:
+    except Exception:
         logger.exception("pipeline[1/4]: unexpected docling error")
         raise HTTPException(status_code=502, detail="docling-service failed unexpectedly")
     docling_seconds = time.monotonic() - t0
@@ -170,12 +238,15 @@ async def _run_pipeline(
     ]
 
     # ── Stage 4: VLM extraction ───────────────────────────────────────────────
+    # Computed fields (e.g. combined Mail Order RX) are excluded from the VLM
+    # prompt and derived from the individual tier values in post-processing.
     logger.info("pipeline[4/4]: VLM extraction — start")
     t0 = time.monotonic()
+    vlm_fields = vlm_field_names(field_names)
     try:
         vlm_result = await extract_fields(
             category=category,
-            field_names=field_names,
+            field_names=vlm_fields,
             page_markdowns=selected_markdowns,
             page_images=rendered_images,
         )
@@ -184,17 +255,23 @@ async def _run_pipeline(
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="VLM service unreachable")
     except httpx.HTTPStatusError as exc:
+        body_preview = exc.response.text[:300].strip()
         raise HTTPException(
             status_code=502,
-            detail=f"VLM service returned HTTP {exc.response.status_code}",
+            detail=f"VLM service returned HTTP {exc.response.status_code}: {body_preview}",
         )
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=f"VLM returned invalid JSON: {exc}")
-    except Exception as exc:
+    except Exception:
         logger.exception("pipeline[4/4]: unexpected VLM error")
         raise HTTPException(status_code=502, detail="VLM extraction failed unexpectedly")
     vlm_extraction_seconds = time.monotonic() - t0
     logger.info(f"pipeline[4/4]: done in {vlm_extraction_seconds:.2f}s")
+
+    # ── Post-processing: compute derived fields, then serialize ───────────────
+    raw_fields = vlm_result.get("fields", {})
+    processed_fields = apply_post_processing(raw_fields, field_names)
+    serialized_fields = _nulls_to_empty(processed_fields)
 
     total_seconds = time.monotonic() - pipeline_start
     stage_timings = StageTimings(
@@ -214,7 +291,7 @@ async def _run_pipeline(
     )
 
     return ExtractionResponse(
-        fields=vlm_result.get("fields", {}),
+        fields=serialized_fields,
         low_confidence_fields=vlm_result.get("low_confidence_fields", []),
         pages_used=selected_page_numbers,
         processing_time_seconds=round(total_seconds, 3),

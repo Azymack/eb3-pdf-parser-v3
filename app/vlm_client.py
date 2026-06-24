@@ -114,20 +114,36 @@ def _build_messages(
         f"You are an insurance document extraction specialist. "
         f"Extract the specified fields from the provided {display_category} insurance plan document. "
         f"Use null for any field not present or not applicable. "
-        f"List uncertain or ambiguous fields in low_confidence_fields."
+        f"List uncertain or ambiguous fields in low_confidence_fields. "
+        f"You MUST respond with ONLY valid JSON — no markdown, no explanation, no code fences. "
+        f"Start your response with {{ and end with }}.\n\n"
+        f"IMPORTANT — single-column benefit tables: Some insurance documents present benefit "
+        f"sections (e.g., Preventive Services, Basic Services, Major Services) with a SINGLE "
+        f"'What You Pay' column rather than separate In-Network and Out-of-Network columns. "
+        f"This layout means the stated cost applies equally to BOTH networks. "
+        f"When a benefit section has only one cost column and the document elsewhere shows "
+        f"out-of-network deductible or annual maximum values (confirming OON coverage exists), "
+        f"populate BOTH the In-Network AND the Out-of-Network fields for each benefit row "
+        f"with that same single value. "
+        f"Do NOT leave Out-of-Network blank just because no separate Out-of-Network column "
+        f"is visible in the service table — check whether the plan has OON cost-share details "
+        f"and, if so, treat a missing OON service column as 'same as In-Network'."
     )
 
     user_text = (
         f"Extract all fields for this {display_category} insurance plan.\n\n"
         f"**Fields to extract:**\n{fields_list}\n\n"
-        f"**Document text (per page):**\n\n{markdown_sections}"
+        f"**Document text (per page):**\n\n{markdown_sections}\n\n"
+        f'Return ONLY raw JSON with this exact structure: '
+        f'{{"fields": {{"Field Name": "value or null", ...}}, "low_confidence_fields": ["Field Name", ...]}}'
     )
 
     content: list[dict] = [{"type": "text", "text": user_text}]
     for img in page_images:
+        mime = img.get("mime_type", "image/jpeg")
         content.append({
             "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{img['image_b64']}"},
+            "image_url": {"url": f"data:{mime};base64,{img['image_b64']}"},
         })
 
     return [
@@ -166,8 +182,14 @@ async def extract_fields(
 
     try:
         raw_content = await _chat_completion(messages, extra_body={"guided_json": schema})
-        result = json.loads(raw_content)
+        # Strip markdown code fences in case the model wraps its output despite instructions.
+        cleaned = raw_content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        result = json.loads(cleaned)
     except (json.JSONDecodeError, ValueError) as exc:
+        logger.error(
+            "vlm_client: JSON parse failed",
+            extra={"content_preview": (raw_content or "")[:300]},
+        )
         raise ValueError(f"VLM returned unparseable content: {exc}") from exc
 
     logger.info(

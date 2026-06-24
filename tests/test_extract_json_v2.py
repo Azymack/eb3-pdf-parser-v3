@@ -5,6 +5,7 @@ never hit real services and run without GPU/network.
 """
 import pytest
 import httpx
+from httpx import Response as HttpxResponse
 from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient, ASGITransport
 
@@ -63,7 +64,8 @@ def mock_pipeline():
 
 
 @pytest.mark.asyncio
-async def test_success_returns_correct_shape(mock_pipeline):
+async def test_success_default_returns_fields_only(mock_pipeline):
+    """Default response (no include_metadata) is the flat fields object, not wrapped."""
     mock_docling, mock_vlm, mock_render = mock_pipeline
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
@@ -76,7 +78,36 @@ async def test_success_returns_correct_shape(mock_pipeline):
     assert response.status_code == 200
     body = response.json()
 
-    # Shape assertions
+    # Default shape is the fields dict directly — no metadata wrapper keys
+    assert "Carrier Name" in body
+    assert body["Carrier Name"] == "Acme Insurance"
+    assert "low_confidence_fields" not in body
+    assert "pages_used" not in body
+    assert "stage_timings" not in body
+    assert "fields" not in body
+
+    mock_docling.assert_awaited_once()
+    mock_vlm.assert_awaited_once()
+    mock_render.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_success_include_metadata_returns_full_shape(mock_pipeline):
+    """?include_metadata=true returns the full metadata envelope."""
+    mock_docling, mock_vlm, mock_render = mock_pipeline
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/extract_json_v2",
+            headers=HEADERS_OK,
+            files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
+            data={"category": "dental"},
+            params={"include_metadata": "true"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+
+    # Full metadata shape
     assert "fields" in body
     assert "low_confidence_fields" in body
     assert "pages_used" in body
@@ -96,14 +127,9 @@ async def test_success_returns_correct_shape(mock_pipeline):
     assert isinstance(body["pages_used"], list)
     assert 1 in body["pages_used"]
 
-    # All stage times must be non-negative numbers
     for key, val in timings.items():
         assert isinstance(val, float | int), f"{key} should be numeric"
         assert val >= 0
-
-    mock_docling.assert_awaited_once()
-    mock_vlm.assert_awaited_once()
-    mock_render.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -223,6 +249,95 @@ async def test_non_pdf_file_returns_400():
         )
     assert response.status_code == 400
     assert "PDF" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_vlm_nginx_413_returns_502_with_body(mock_pipeline):
+    """When the VLM's nginx returns 413, we surface the status and body in the 502 detail."""
+    mock_docling, mock_vlm, mock_render = mock_pipeline
+    nginx_413_body = (
+        b"<html>\r\n<head><title>413 Request Entity Too Large</title></head>\r\n"
+        b"<body>\r\n<center><h1>413 Request Entity Too Large</h1></center>\r\n"
+        b"<hr><center>nginx/1.18.0 (Ubuntu)</center>\r\n</body>\r\n</html>"
+    )
+    mock_vlm.side_effect = httpx.HTTPStatusError(
+        "413",
+        request=httpx.Request("POST", "http://vlm/v1/chat/completions"),
+        response=HttpxResponse(413, content=nginx_413_body),
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/extract_json_v2",
+            headers=HEADERS_OK,
+            files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
+            data={"category": "dental"},
+        )
+
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert "413" in detail
+    assert "nginx" in detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_nested_dict_field_serialized_as_flat_string(mock_pipeline):
+    """VLM sometimes returns nested objects for multi-tier fields (e.g. Root Canal costs
+    per tooth type). These must be flattened to a string rather than causing a 500."""
+    mock_docling, mock_vlm, mock_render = mock_pipeline
+    mock_vlm.return_value = {
+        "fields": {
+            "Carrier Name": "Acme",
+            # VLM returned a nested dict instead of a string — happens for multi-tier fields
+            "In-Network Root Canal": {"Anterior": "$100", "Bicuspid": "$150", "Molar": "$200"},
+        },
+        "low_confidence_fields": [],
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/extract_json_v2",
+            headers=HEADERS_OK,
+            files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
+            data={"category": "dental"},
+        )
+
+    assert response.status_code == 200, f"Expected 200, got 500: {response.text[:300]}"
+    body = response.json()
+    root_canal = body["In-Network Root Canal"]
+    assert isinstance(root_canal, str)
+    assert "$100" in root_canal
+    assert "$150" in root_canal
+    assert "$200" in root_canal
+
+
+@pytest.mark.asyncio
+async def test_null_fields_serialized_as_empty_string(mock_pipeline):
+    """VLM null values must become '' in the API response, never JSON null."""
+    mock_docling, mock_vlm, mock_render = mock_pipeline
+    # Simulate a VLM response where some fields are null
+    mock_vlm.return_value = {
+        "fields": {
+            "Carrier Name": "Acme Insurance",
+            "Plan Name": None,          # null — not on plan
+            "In-Network Single Deductible": "NOT_FOUND",  # sentinel — should be preserved
+        },
+        "low_confidence_fields": [],
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/extract_json_v2",
+            headers=HEADERS_OK,
+            files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
+            data={"category": "dental"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["Plan Name"] == ""            # null → ""
+    assert body["Carrier Name"] == "Acme Insurance"
+    assert body["In-Network Single Deductible"] == "NOT_FOUND"  # sentinel preserved
 
 
 @pytest.mark.asyncio

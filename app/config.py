@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     VALID_API_KEYS: str = "eb3-key-1,eb3-key-2"
 
     PAGE_ROUTING_TOP_N: int = 5
-    REQUEST_TIMEOUT_SECONDS: int = 45
+    REQUEST_TIMEOUT_SECONDS: int = 120
     MAX_FILE_SIZE_MB: int = 50
 
     VLM_BASE_URL: str = "http://129.212.178.134"

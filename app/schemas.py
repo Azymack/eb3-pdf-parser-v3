@@ -37,7 +37,8 @@ class StageTimings(BaseModel):
 
 
 class ExtractionResponse(BaseModel):
-    fields: dict[str, str | None]
+    # fields has null values pre-converted to ""; see _nulls_to_empty in main.py.
+    fields: dict[str, str]
     low_confidence_fields: list[str]
     pages_used: list[int]
     processing_time_seconds: float

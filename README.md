@@ -20,7 +20,33 @@ Receives a PDF + category, runs it through the full pipeline, and returns struct
 | `file` | binary | Yes | PDF document, max 50 MB (configurable) |
 | `category` | string | Yes | One of: `accident`, `critical_illness`, `dental`, `health`, `health_3tier`, `ltd`, `std`, `sup_life`, `term_life`, `vision` |
 
-**Response 200**
+**Query parameters**
+
+| Parameter | Type | Default | Notes |
+|-----------|------|---------|-------|
+| `include_metadata` | boolean | `false` | When `true`, wraps the response in a metadata envelope (see below) |
+
+---
+
+#### Default response (fields object directly)
+
+By default the response body **is** the extracted fields object — a flat JSON object
+where each key is a field name and each value is a string.  Fields not found on the
+plan are returned as `""` (empty string).
+
+```json
+{
+  "Carrier Name": "Acme",
+  "Plan Name": "Gold PPO",
+  "In-Network Single Deductible": "$500",
+  "Out-of-Network Single Deductible": "",
+  ...
+}
+```
+
+#### With `?include_metadata=true`
+
+Returns the full metadata envelope:
 
 ```json
 {
@@ -37,6 +63,13 @@ Receives a PDF + category, runs it through the full pipeline, and returns struct
 }
 ```
 
+> **Breaking change (v2.1):** Prior to this version the default response was the
+> full metadata envelope. If you were parsing `response["fields"]` from the default
+> response, either add `?include_metadata=true` to your request, or update your
+> parser to treat the response body as the fields object directly.
+
+---
+
 **Error codes**
 
 | Code | Meaning |
@@ -45,7 +78,24 @@ Receives a PDF + category, runs it through the full pipeline, and returns struct
 | 401 | Missing or invalid `X-EB3-Token` |
 | 413 | File exceeds `MAX_FILE_SIZE_MB` (default 50 MB) |
 | 502 | docling-service or VLM unreachable/returned an error — detail field names which stage failed |
-| 504 | Total pipeline exceeded `REQUEST_TIMEOUT_SECONDS` (default 45 s) |
+| 504 | Total pipeline exceeded `REQUEST_TIMEOUT_SECONDS` (default 120 s) |
+
+### POST /llm_test
+
+Sends a plain-text prompt to the VLM and returns the raw reply. Useful for
+verifying connectivity and model behaviour without running a full PDF pipeline.
+
+**Body** — `multipart/form-data`
+
+| Field | Type | Required |
+|-------|------|----------|
+| `prompt` | string | Yes |
+
+**Response 200**
+
+```json
+{ "response": "Hello from the model" }
+```
 
 ## Pipeline stages
 
@@ -54,12 +104,27 @@ POST /extract_json_v2
   │
   ├─ [1] docling-service  — PDF → per-page markdown + structured data
   ├─ [2] page router      — keyword scoring, select top-N pages
-  ├─ [3] image renderer   — PyMuPDF renders selected pages to PNG
+  ├─ [3] image renderer   — PyMuPDF renders selected pages to JPEG
   └─ [4] VLM (vLLM)       — guided_json extraction against category schema
+  └─ [*] post-processing  — compute derived fields (e.g. combined Mail Order RX)
 ```
 
-`stage_timings` in every response shows the wall-clock cost of each stage,
-making it easy to identify the bottleneck without guessing.
+`stage_timings` (available with `?include_metadata=true`) shows the wall-clock
+cost of each stage, making it easy to identify the bottleneck.
+
+### Field computation — Mail Order RX
+
+For the `health` and `health_3tier` categories, the following combined fields
+are **computed** from individual per-tier values rather than extracted directly:
+
+- `In-Network Mail Order RX` = join of Generic / Brand / Tier 3 / Tier 4 / Tier 5 Mail Order RX values
+- `Out-of-Network Mail Order RX` — same pattern
+- `Designated Network Mail Order RX` — same (health_3tier only)
+
+Format: non-empty tier values joined by `" / "` in tier order.
+Example: `"$10 / $30 / $30"` (Generic=$10, Brand=$30, Tier3=$30, Tier4 and Tier5 absent).
+
+If all tier values are absent the combined field is `""`.
 
 ## Configuration
 
@@ -75,7 +140,7 @@ Copy `.env.example` to `.env` and fill in the required values.
 | `VLM_BASE_URL` | `http://localhost:8000` | vLLM server |
 | `VLM_MODEL` | `default-vlm-model` | Model identifier passed to vLLM |
 | `PAGE_ROUTING_TOP_N` | `5` | Number of pages sent to VLM |
-| `REQUEST_TIMEOUT_SECONDS` | `45` | Total pipeline timeout |
+| `REQUEST_TIMEOUT_SECONDS` | `120` | Total pipeline timeout |
 | `MAX_FILE_SIZE_MB` | `50` | Upload size cap |
 | `VALID_API_KEYS` | `eb3-key-1,eb3-key-2` | Comma-separated key allowlist |
 
