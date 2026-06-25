@@ -39,6 +39,8 @@ VLM_RESPONSE = {
         "Plan Name": "Gold PPO",
         "In-Network Single Deductible": "$500",
         "In-Network Family Deductible": "$1000",
+        "In-Network RX": "Tier 1 (Generic): $10 / Tier 2 (Brand): $40 / Tier 3: 50%",
+        "In-Network Mail Order RX": "Tier 1: $20 / Tier 2: $80",
     },
     "low_confidence_fields": ["Plan Name"],
 }
@@ -338,6 +340,51 @@ async def test_null_fields_serialized_as_empty_string(mock_pipeline):
     assert body["Plan Name"] == ""            # null → ""
     assert body["Carrier Name"] == "Acme Insurance"
     assert body["In-Network Single Deductible"] == "NOT_FOUND"  # sentinel preserved
+
+
+@pytest.mark.asyncio
+async def test_rx_tier_string_passed_through_to_response(mock_pipeline):
+    """New consolidated RX field is returned verbatim in the flat response."""
+    mock_docling, mock_vlm, mock_render = mock_pipeline
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/extract_json_v2",
+            headers=HEADERS_OK,
+            files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
+            data={"category": "health"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    # New field present, value passed through verbatim
+    assert body["In-Network RX"] == "Tier 1 (Generic): $10 / Tier 2 (Brand): $40 / Tier 3: 50%"
+    assert body["In-Network Mail Order RX"] == "Tier 1: $20 / Tier 2: $80"
+    # Old per-tier fields must not appear (schema removed them)
+    assert "In-Network Generic RX" not in body
+    assert "In-Network Brand RX" not in body
+    assert "In-Network Tier 3 RX" not in body
+    assert "In-Network Generic Mail Order RX" not in body
+
+
+@pytest.mark.asyncio
+async def test_vlm_prompt_does_not_request_old_rx_fields(mock_pipeline):
+    """VLM is called with the new schema — old per-tier field names are absent."""
+    mock_docling, mock_vlm, mock_render = mock_pipeline
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post(
+            "/extract_json_v2",
+            headers=HEADERS_OK,
+            files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
+            data={"category": "health"},
+        )
+    # extract_fields was called — check its field_names argument
+    call_args = mock_vlm.call_args
+    field_names_used = call_args.kwargs.get("field_names") or call_args.args[1]
+    assert "In-Network RX" in field_names_used
+    assert "In-Network Mail Order RX" in field_names_used
+    assert "In-Network Generic RX" not in field_names_used
+    assert "In-Network Brand RX" not in field_names_used
+    assert "In-Network Tier 3 RX" not in field_names_used
+    assert "In-Network Generic Mail Order RX" not in field_names_used
 
 
 @pytest.mark.asyncio
