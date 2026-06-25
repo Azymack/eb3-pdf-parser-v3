@@ -132,7 +132,8 @@ Copy `.env.example` to `.env` and fill in the required values.
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `DOCLING_PROXY_URL` | *(none)* | **Required at deploy time.** Outbound proxy for docling-service and VLM. See below. |
+| `USE_OUTBOUND_PROXY` | `false` | Set `true` to route docling and VLM through the proxy below |
+| `DOCLING_PROXY_URL` | *(none)* | Proxy URL — only used when `USE_OUTBOUND_PROXY=true`. See below. |
 | `DOCLING_SERVICE_URL` | `http://129.212.178.134:8001` | |
 | `DOCLING_ENDPOINT` | `/convert-gpu` | Switch to `/convert` for CPU-only |
 | `DOCLING_OCR_MODE` | `auto` | `auto` \| `force` \| `off` |
@@ -144,19 +145,18 @@ Copy `.env.example` to `.env` and fill in the required values.
 | `MAX_FILE_SIZE_MB` | `50` | Upload size cap |
 | `VALID_API_KEYS` | `eb3-key-1,eb3-key-2` | Comma-separated key allowlist |
 
-## DOCLING_PROXY_URL — deployment requirement
+## Outbound proxy (dev vs production)
 
-docling-service at `http://129.212.178.134:8001` is behind an IP allowlist, and the
-VLM server is reached the same way. This orchestrator is **not** on that allowlist and
-must connect to both via an HTTP proxy.
+docling-service and the VLM server may be behind an IP allowlist. Hosts **not** on that
+allowlist must connect through an HTTP proxy.
 
-**You must set `DOCLING_PROXY_URL` in the deployment environment** (via `.env`,
-your CI/CD secrets store, or however your team manages secrets).  
-Whoever deploys this service needs to obtain the proxy URL out-of-band
-(direct communication or secrets manager) — it should never appear in tickets,
-chat logs, or source control.
+| Environment | `.env` |
+|-------------|--------|
+| **Production** (direct access) | `USE_OUTBOUND_PROXY=false` — no proxy needed |
+| **Local / staging** (not allowlisted) | `USE_OUTBOUND_PROXY=true` and set `DOCLING_PROXY_URL` |
 
-Do not add the value to `.env.example` or commit it anywhere.
+Obtain the proxy URL out-of-band (secrets manager or direct handoff) — never commit it or
+paste it into tickets or chat logs.
 
 ## Security note — X-EB3-Token
 

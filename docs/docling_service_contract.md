@@ -6,8 +6,9 @@ Confirmed live from `GET http://129.212.178.134:8001/openapi.json` on 2026-06-21
 
 `http://129.212.178.134:8001`
 
-**Network note:** This host is behind an IP allowlist. This orchestrator must route all
-requests through the HTTP proxy specified by `DOCLING_PROXY_URL` (see `.env.example`).
+**Network note:** This host may be behind an IP allowlist. When `USE_OUTBOUND_PROXY=true`,
+route requests through `DOCLING_PROXY_URL` (see `.env.example`). Production hosts with
+direct access should leave `USE_OUTBOUND_PROXY=false`.
 
 ## Endpoints
 

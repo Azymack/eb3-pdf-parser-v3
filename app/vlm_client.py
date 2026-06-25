@@ -19,7 +19,7 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=5.0)
 async def _chat_completion(messages: list[dict], *, extra_body: dict | None = None) -> str:
     """POST to the VLM chat completions endpoint and return message content."""
     settings = get_settings()
-    proxy = settings.DOCLING_PROXY_URL
+    proxy = settings.outbound_proxy_url
     endpoint = f"{settings.VLM_BASE_URL}/v1/chat/completions"
 
     payload: dict[str, Any] = {
@@ -64,7 +64,7 @@ async def complete_prompt(prompt: str) -> str:
     """Send a plain-text prompt to the VLM and return the model's reply."""
     logger.info(
         "vlm_client: llm_test prompt",
-        extra={"via_proxy": get_settings().DOCLING_PROXY_URL is not None},
+        extra={"via_proxy": get_settings().outbound_proxy_url is not None},
     )
     return await _chat_completion([{"role": "user", "content": prompt}])
 
@@ -179,7 +179,7 @@ async def extract_fields(
 ) -> dict[str, Any]:
     """Call the VLM and return {"fields": {...}, "low_confidence_fields": [...]}.
 
-    Routes through DOCLING_PROXY_URL when set (same outbound proxy as docling-service).
+    Routes through the outbound proxy when USE_OUTBOUND_PROXY=true (same as docling-service).
     Raises:
         httpx.ProxyError: proxy is unreachable
         httpx.ConnectError: proxy reachable but VLM service is not
@@ -195,7 +195,7 @@ async def extract_fields(
         extra={
             "category": category,
             "endpoint": f"{settings.VLM_BASE_URL}/v1/chat/completions",
-            "via_proxy": settings.DOCLING_PROXY_URL is not None,
+            "via_proxy": settings.outbound_proxy_url is not None,
         },
     )
 

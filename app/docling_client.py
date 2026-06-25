@@ -13,7 +13,7 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
 async def convert_pdf(pdf_bytes: bytes, filename: str) -> dict:
     """POST the PDF to docling-service and return the parsed ConvertResponse dict.
 
-    Routes through DOCLING_PROXY_URL when set (required: this host is not IP-allowlisted).
+    Routes through the outbound proxy when USE_OUTBOUND_PROXY=true and DOCLING_PROXY_URL is set.
     Raises distinct exceptions so the caller can surface precise 502 error details:
       - httpx.ProxyError     → proxy is unreachable
       - httpx.ConnectError   → proxy reachable but docling-service is not
@@ -21,7 +21,7 @@ async def convert_pdf(pdf_bytes: bytes, filename: str) -> dict:
       - ValueError           → response body is not valid JSON
     """
     settings = get_settings()
-    proxy = settings.DOCLING_PROXY_URL
+    proxy = settings.outbound_proxy_url
     endpoint = f"{settings.DOCLING_SERVICE_URL}{settings.DOCLING_ENDPOINT}"
 
     # Log the target path and a generic "via proxy" flag — never log the proxy URL
