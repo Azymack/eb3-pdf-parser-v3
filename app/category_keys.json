@@ -94,11 +94,16 @@
     "In-Network Newborn Delivery", "Out-of-Network Newborn Delivery",
     "In-Network Major Diagnostics", "Out-of-Network Major Diagnostics",
     "In-Network RX Deductible", "Out-of-Network RX Deductible",
-    "In-Network RX", "Out-of-Network RX",
+    "In-Network Generic RX", "Out-of-Network Generic RX",
+    "In-Network Brand RX", "Out-of-Network Brand RX",
+    "In-Network Tier 3 RX", "Out-of-Network Tier 3 RX",
+    "In-Network Tier 4 RX", "Out-of-Network Tier 4 RX",
+    "In-Network Tier 5 RX", "Out-of-Network Tier 5 RX",
     "In-Network Mail Order RX", "Out-of-Network Mail Order RX",
     "Plan Year", "Deductible Period", "Deductible Explanation",
     "Network Type", "Network Name",
-    "Member Website", "Customer Service Phone Number"
+    "Member Website", "Customer Service Phone Number",
+    "In-Network RX", "Out-of-Network RX"
   ],
   "health_3tier": [
     "Carrier Name", "Plan Name",
@@ -119,10 +124,15 @@
     "Designated Network Newborn Delivery", "In-Network Newborn Delivery", "Out-of-Network Newborn Delivery",
     "Designated Network Major Diagnostics", "In-Network Major Diagnostics", "Out-of-Network Major Diagnostics",
     "Designated Network RX Deductible", "In-Network RX Deductible", "Out-of-Network RX Deductible",
-    "Designated Network RX", "In-Network RX", "Out-of-Network RX",
+    "In-Network Generic RX", "Out-of-Network Generic RX",
+    "In-Network Brand RX", "Out-of-Network Brand RX",
+    "In-Network Tier 3 RX", "Out-of-Network Tier 3 RX",
+    "In-Network Tier 4 RX", "Out-of-Network Tier 4 RX",
+    "In-Network Tier 5 RX", "Out-of-Network Tier 5 RX",
     "Designated Network Mail Order RX", "In-Network Mail Order RX", "Out-of-Network Mail Order RX",
     "Plan Year", "Deductible Period", "Deductible Explanation",
     "Network Type", "Network Name",
-    "Member Website", "Customer Service Phone Number"
+    "Member Website", "Customer Service Phone Number",
+    "Designated Network RX", "In-Network RX", "Out-of-Network RX"
   ]
 }

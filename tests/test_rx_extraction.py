@@ -25,18 +25,18 @@ HEADERS = {"X-EB3-Token": "eb3-key-1"}
 LIVE = os.getenv("RUN_LIVE_RX_TESTS") == "1"
 live = pytest.mark.skipif(not LIVE, reason="set RUN_LIVE_RX_TESTS=1 to run live VLM tests")
 
-# Old per-tier field names that must never appear in any API response.
+# Fields that must NEVER appear in any API response.
+# In-Network/Out-of-Network tier fields (Generic, Brand, Tier 3-5) are now
+# computed fields that intentionally DO appear — they are NOT in this set.
 OLD_FIELDS = {
-    "In-Network Generic RX", "Out-of-Network Generic RX",
-    "In-Network Brand RX", "Out-of-Network Brand RX",
-    "In-Network Tier 3 RX", "Out-of-Network Tier 3 RX",
-    "In-Network Tier 4 RX", "Out-of-Network Tier 4 RX",
-    "In-Network Tier 5 RX", "Out-of-Network Tier 5 RX",
     "Designated Network Generic RX", "Designated Network Brand RX",
     "Designated Network Tier 3 RX", "Designated Network Tier 4 RX",
     "Designated Network Tier 5 RX",
     "In-Network Generic Mail Order RX", "Out-of-Network Generic Mail Order RX",
     "In-Network Brand Mail Order RX", "Out-of-Network Brand Mail Order RX",
+    "In-Network Tier 3 Mail Order RX", "Out-of-Network Tier 3 Mail Order RX",
+    "In-Network Tier 4 Mail Order RX", "Out-of-Network Tier 4 Mail Order RX",
+    "In-Network Tier 5 Mail Order RX", "Out-of-Network Tier 5 Mail Order RX",
 }
 
 _COST_RE = re.compile(r"\$\d|%|\bno charge\b|\bdeductible\b|\bcopay\b|\bcoinsurance\b", re.I)
@@ -91,7 +91,9 @@ def test_health_schema_has_new_rx_fields():
     health = CATEGORY_FIELDS["health"]
     for field in ("In-Network RX", "Out-of-Network RX",
                   "In-Network Mail Order RX", "Out-of-Network Mail Order RX",
-                  "In-Network RX Deductible", "Out-of-Network RX Deductible"):
+                  "In-Network RX Deductible", "Out-of-Network RX Deductible",
+                  "In-Network Generic RX", "In-Network Brand RX",
+                  "In-Network Tier 3 RX", "In-Network Tier 4 RX", "In-Network Tier 5 RX"):
         assert field in health, f"health schema missing: {field!r}"
     for old in OLD_FIELDS:
         assert old not in health, f"health schema still has old field: {old!r}"
@@ -104,7 +106,9 @@ def test_health_3tier_schema_has_new_rx_fields():
                   "Designated Network Mail Order RX",
                   "In-Network Mail Order RX", "Out-of-Network Mail Order RX",
                   "Designated Network RX Deductible",
-                  "In-Network RX Deductible", "Out-of-Network RX Deductible"):
+                  "In-Network RX Deductible", "Out-of-Network RX Deductible",
+                  "In-Network Generic RX", "In-Network Brand RX",
+                  "In-Network Tier 3 RX", "In-Network Tier 4 RX", "In-Network Tier 5 RX"):
         assert field in h3, f"health_3tier schema missing: {field!r}"
     for old in OLD_FIELDS:
         assert old not in h3, f"health_3tier schema still has old field: {old!r}"

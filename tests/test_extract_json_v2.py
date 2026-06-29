@@ -358,11 +358,10 @@ async def test_rx_tier_string_passed_through_to_response(mock_pipeline):
     # New field present, value passed through verbatim
     assert body["In-Network RX"] == "Tier 1 (Generic): $10 / Tier 2 (Brand): $40 / Tier 3: 50%"
     assert body["In-Network Mail Order RX"] == "Tier 1: $20 / Tier 2: $80"
-    # Old per-tier fields must not appear (schema removed them)
-    assert "In-Network Generic RX" not in body
-    assert "In-Network Brand RX" not in body
-    assert "In-Network Tier 3 RX" not in body
+    # Per-tier fields now appear (computed from consolidated), mail-order tier variants never should
+    assert "In-Network Generic RX" in body  # computed from In-Network RX
     assert "In-Network Generic Mail Order RX" not in body
+    assert "In-Network Brand Mail Order RX" not in body
 
 
 @pytest.mark.asyncio

@@ -272,6 +272,7 @@ async def _run_pipeline(
     raw_fields = vlm_result.get("fields", {})
     processed_fields = apply_post_processing(raw_fields, field_names)
     serialized_fields = _nulls_to_empty(processed_fields)
+    serialized_fields = {k: serialized_fields[k] for k in field_names if k in serialized_fields}
 
     total_seconds = time.monotonic() - pipeline_start
     stage_timings = StageTimings(
