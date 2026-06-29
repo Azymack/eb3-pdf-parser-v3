@@ -183,6 +183,8 @@ uvicorn app.main:app --reload --port 8002
 
 ```bash
 pytest tests/ -v
+
+$env:RUN_LIVE_RX_TESTS=1; python -m pytest tests/test_rx_extraction.py -v
 ```
 
 Tests mock all external services (docling, VLM, PyMuPDF) — no network or GPU required.

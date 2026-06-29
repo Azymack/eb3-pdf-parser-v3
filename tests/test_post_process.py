@@ -23,10 +23,36 @@ def test_vlm_field_names_returns_full_list():
         assert vlm_field_names(fields) == fields
 
 
-def test_apply_post_processing_is_passthrough():
-    fields = {"Carrier Name": "Acme", "In-Network RX": "Tier 1: $10", "Plan Year": None}
+def test_apply_post_processing_normalizes_not_covered():
+    """'Not covered' whole-field values in RX fields become empty string."""
+    fields = {
+        "Carrier Name": "Acme",
+        "In-Network RX": "Tier 1: $10",
+        "Out-of-Network RX": "Not covered",
+        "Out-of-Network Mail Order RX": "Not Covered",
+        "Plan Year": None,
+    }
     result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
-    assert result is fields  # same object, not mutated
+    assert result["In-Network RX"] == "Tier 1: $10"
+    assert result["Out-of-Network RX"] == ""
+    assert result["Out-of-Network Mail Order RX"] == ""
+    assert result["Carrier Name"] == "Acme"
+
+
+def test_apply_post_processing_clears_oon_rx_for_hmo():
+    """HMO plans have OON RX fields cleared regardless of VLM output."""
+    fields = {
+        "Network Type": "HMO",
+        "In-Network RX": "Tier 1: $10 / Tier 2: $35",
+        "Out-of-Network RX": "Tier 1: $10 / Tier 2: $35",
+        "Out-of-Network Mail Order RX": "some value",
+        "Out-of-Network RX Deductible": "$500",
+    }
+    result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+    assert result["In-Network RX"] == "Tier 1: $10 / Tier 2: $35"
+    assert result["Out-of-Network RX"] == ""
+    assert result["Out-of-Network Mail Order RX"] == ""
+    assert result["Out-of-Network RX Deductible"] == ""
 
 
 def test_apply_post_processing_does_not_mutate():

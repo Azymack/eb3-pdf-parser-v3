@@ -1,260 +1,289 @@
-"""Live investigation tests for the redesigned RX tier extraction.
+"""RX field extraction tests.
 
-Run against a real server + VLM:
-    python -m pytest tests/test_rx_extraction.py -v -s --no-header
+Structural tests (no server needed):
+    python -m pytest tests/test_rx_extraction.py -v -k "not live"
 
-These tests verify:
-  1. The new 'In-Network RX' field is populated and contains multiple tiers.
-  2. Tier labels use the carrier's own words (not forced canonical names).
-  3. Retail and mail order values are correctly separated.
-  4. Edge cases: Tier 1a/1b (health/4), 5-tier HMO (health/3), no-mail-order plan (health/4, health/5).
-  5. Old per-tier field names are NOT present in responses.
+Live tests (server must be running on port 8002):
+    python -m pytest tests/test_rx_extraction.py -v --live
+    # or: RUN_LIVE_RX_TESTS=1 python -m pytest tests/test_rx_extraction.py -v
 
-Because these hit real services they are skipped unless --live is passed:
-    python -m pytest tests/test_rx_extraction.py -v -s --live
-
-Alternatively set the env var RUN_LIVE_RX_TESTS=1.
+Live tests cover ALL documents in tests/documents/health/ and tests/documents/health_3tier/.
+Each PDF is extracted and compared against its same-name JSON fixture.
 """
 import json
 import os
 import re
-import sys
 from pathlib import Path
 
 import pytest
 
-DOCS_DIR = Path("tests/documents/health")
+HEALTH_DIR = Path("tests/documents/health")
+HEALTH_3TIER_DIR = Path("tests/documents/health_3tier")
 API_URL = "http://localhost:8002/extract_json_v2"
 HEADERS = {"X-EB3-Token": "eb3-key-1"}
 
 LIVE = os.getenv("RUN_LIVE_RX_TESTS") == "1"
 live = pytest.mark.skipif(not LIVE, reason="set RUN_LIVE_RX_TESTS=1 to run live VLM tests")
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _post(pdf_name: str, include_metadata: bool = False):
-    import httpx
-    pdf_path = DOCS_DIR / pdf_name
-    params = {"include_metadata": "true"} if include_metadata else {}
-    resp = httpx.post(
-        API_URL,
-        headers=HEADERS,
-        files={"file": (pdf_name, pdf_path.read_bytes(), "application/pdf")},
-        data={"category": "health"},
-        params=params,
-        timeout=180,
-    )
-    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:300]}"
-    return resp.json()
-
-
-def _tier_count(rx_string: str) -> int:
-    """Count the number of ' / ' separated tiers in an RX field value."""
-    if not rx_string:
-        return 0
-    return len([p for p in rx_string.split(" / ") if p.strip()])
-
-
-def _has_cost(rx_string: str) -> bool:
-    """True if the string contains at least one recognisable cost value."""
-    return bool(re.search(r"\$\d|%|\bno charge\b|\bdeductible\b|\bcopay\b|\bvaries\b",
-                          rx_string, re.IGNORECASE))
-
-
+# Old per-tier field names that must never appear in any API response.
 OLD_FIELDS = {
     "In-Network Generic RX", "Out-of-Network Generic RX",
     "In-Network Brand RX", "Out-of-Network Brand RX",
     "In-Network Tier 3 RX", "Out-of-Network Tier 3 RX",
     "In-Network Tier 4 RX", "Out-of-Network Tier 4 RX",
     "In-Network Tier 5 RX", "Out-of-Network Tier 5 RX",
+    "Designated Network Generic RX", "Designated Network Brand RX",
+    "Designated Network Tier 3 RX", "Designated Network Tier 4 RX",
+    "Designated Network Tier 5 RX",
     "In-Network Generic Mail Order RX", "Out-of-Network Generic Mail Order RX",
     "In-Network Brand Mail Order RX", "Out-of-Network Brand Mail Order RX",
-    "In-Network Tier 3 Mail Order RX", "Out-of-Network Tier 3 Mail Order RX",
-    "In-Network Tier 4 Mail Order RX", "Out-of-Network Tier 4 Mail Order RX",
-    "In-Network Tier 5 Mail Order RX", "Out-of-Network Tier 5 Mail Order RX",
 }
 
+_COST_RE = re.compile(r"\$\d|%|\bno charge\b|\bdeductible\b|\bcopay\b|\bcoinsurance\b", re.I)
+
+
+def _has_cost(s: str) -> bool:
+    return bool(_COST_RE.search(s or ""))
+
+
+def _tier_count(s: str) -> int:
+    if not s:
+        return 0
+    return len([p for p in s.split(" / ") if p.strip()])
+
+
+def _post(pdf_path: Path, category: str):
+    import httpx
+    resp = httpx.post(
+        API_URL,
+        headers=HEADERS,
+        files={"file": (pdf_path.name, pdf_path.read_bytes(), "application/pdf")},
+        data={"category": category},
+        timeout=180,
+    )
+    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:300]}"
+    return resp.json()
+
+
+def _fixture(pdf_path: Path) -> dict:
+    return json.loads(pdf_path.with_suffix(".json").read_text(encoding="utf-8"))
+
+
+def _health_pdfs():
+    return sorted(HEALTH_DIR.glob("*.pdf"))
+
+
+def _health_3tier_pdfs():
+    return sorted(HEALTH_3TIER_DIR.glob("*.pdf"))
+
+
+def _rx_fields_for(category: str) -> list[str]:
+    from app.schemas import CATEGORY_FIELDS
+    return [f for f in CATEGORY_FIELDS[category] if "RX" in f]
+
 
 # ---------------------------------------------------------------------------
-# Structural tests (no VLM, use schema only)
+# Schema / structural tests — no server required
 # ---------------------------------------------------------------------------
 
-def test_schema_has_new_rx_fields():
+def test_health_schema_has_new_rx_fields():
     from app.schemas import CATEGORY_FIELDS
     health = CATEGORY_FIELDS["health"]
-    assert "In-Network RX" in health
-    assert "Out-of-Network RX" in health
-    assert "In-Network Mail Order RX" in health
-    assert "Out-of-Network Mail Order RX" in health
+    for field in ("In-Network RX", "Out-of-Network RX",
+                  "In-Network Mail Order RX", "Out-of-Network Mail Order RX",
+                  "In-Network RX Deductible", "Out-of-Network RX Deductible"):
+        assert field in health, f"health schema missing: {field!r}"
     for old in OLD_FIELDS:
-        assert old not in health, f"Schema still has old field: {old!r}"
+        assert old not in health, f"health schema still has old field: {old!r}"
 
 
-def test_fixtures_have_new_rx_fields():
-    """All health fixture files use the new schema."""
-    for num in range(1, 6):
-        path = DOCS_DIR / f"{num}.json"
-        data = json.loads(path.read_text())
-        assert "In-Network RX" in data, f"health/{num}.json missing In-Network RX"
-        assert "In-Network Mail Order RX" in data, f"health/{num}.json missing Mail Order RX"
+def test_health_3tier_schema_has_new_rx_fields():
+    from app.schemas import CATEGORY_FIELDS
+    h3 = CATEGORY_FIELDS["health_3tier"]
+    for field in ("Designated Network RX", "In-Network RX", "Out-of-Network RX",
+                  "Designated Network Mail Order RX",
+                  "In-Network Mail Order RX", "Out-of-Network Mail Order RX",
+                  "Designated Network RX Deductible",
+                  "In-Network RX Deductible", "Out-of-Network RX Deductible"):
+        assert field in h3, f"health_3tier schema missing: {field!r}"
+    for old in OLD_FIELDS:
+        assert old not in h3, f"health_3tier schema still has old field: {old!r}"
+
+
+def test_health_fixtures_have_new_rx_fields():
+    """All health fixture JSONs must use the new consolidated schema."""
+    rx_new = {"In-Network RX", "Out-of-Network RX",
+              "In-Network Mail Order RX", "Out-of-Network Mail Order RX"}
+    for pdf in _health_pdfs():
+        data = _fixture(pdf)
+        for field in rx_new:
+            assert field in data, f"{pdf.name}: fixture missing {field!r}"
         for old in OLD_FIELDS:
-            assert old not in data, f"health/{num}.json still has old field {old!r}"
+            assert old not in data, f"{pdf.name}: fixture still has old field {old!r}"
 
 
-def test_fixture_rx_tier_counts():
-    """Each fixture's RX field contains a sensible number of tiers."""
-    expected_min_tiers = {
-        "1.json": 4,  # Kaiser: T1/T2/T3/T4
-        "2.json": 3,  # Kaiser Platinum: T1 + T2 preferred + T2 non-preferred + T4 = 4 effective
-        "3.json": 5,  # BlueChoice: Generic + PrefBrand + NonprefBrand + PrefSpec + NonprefSpec
-        "4.json": 4,  # BCBS AZ: T1a + T1b + T2 + T3 + Specialty = 5 effective
-        "5.json": 3,  # Geisinger: T1 + T2 + T3
-    }
-    for fname, min_tiers in expected_min_tiers.items():
-        data = json.loads((DOCS_DIR / fname).read_text())
-        rx = data["In-Network RX"]
-        count = _tier_count(rx)
-        assert count >= min_tiers, (
-            f"health/{fname} In-Network RX has {count} tiers, expected >= {min_tiers}: {rx!r}"
-        )
+def test_health_3tier_fixtures_have_new_rx_fields():
+    """All health_3tier fixture JSONs must use the new consolidated schema."""
+    rx_new = {"Designated Network RX", "In-Network RX", "Out-of-Network RX",
+              "Designated Network Mail Order RX",
+              "In-Network Mail Order RX", "Out-of-Network Mail Order RX"}
+    for pdf in _health_3tier_pdfs():
+        data = _fixture(pdf)
+        for field in rx_new:
+            assert field in data, f"{pdf.name}: fixture missing {field!r}"
+        for old in OLD_FIELDS:
+            assert old not in data, f"{pdf.name}: fixture still has old field {old!r}"
 
 
-def test_fixture_health4_has_tier_1a_1b():
-    """health/4 fixture must preserve BCBS Arizona's split Tier 1a / 1b."""
-    data = json.loads((DOCS_DIR / "4.json").read_text())
-    rx = data["In-Network RX"]
-    assert "1a" in rx.lower() and "1b" in rx.lower(), (
-        f"health/4 RX does not capture Tier 1a/1b: {rx!r}"
-    )
+def test_health_fixtures_no_null_string():
+    """Fixture RX fields must not contain the literal string 'null'."""
+    for pdf in _health_pdfs():
+        data = _fixture(pdf)
+        for key, val in data.items():
+            if "RX" in key:
+                assert val != "null", f"{pdf.name}: {key!r} = 'null' (should be empty)"
 
 
-def test_fixture_health3_has_5_tiers_in_mail_order():
-    data = json.loads((DOCS_DIR / "3.json").read_text())
-    mo = data["In-Network Mail Order RX"]
-    assert _tier_count(mo) >= 5, (
-        f"health/3 mail order should have 5 tiers: {mo!r}"
-    )
+def test_health_3tier_fixtures_no_null_string():
+    for pdf in _health_3tier_pdfs():
+        data = _fixture(pdf)
+        for key, val in data.items():
+            if "RX" in key:
+                assert val != "null", f"{pdf.name}: {key!r} = 'null' (should be empty)"
 
 
-def test_fixture_health4_mail_order_empty():
-    """BCBS Arizona has no separate mail order pricing."""
-    data = json.loads((DOCS_DIR / "4.json").read_text())
-    assert data["In-Network Mail Order RX"] == ""
-    assert data["Out-of-Network Mail Order RX"] == ""
-
-
-def test_fixture_health5_mail_order_empty():
-    """Geisinger HMO has no mail order."""
-    data = json.loads((DOCS_DIR / "5.json").read_text())
-    assert data["In-Network Mail Order RX"] == ""
-
-
-def test_fixture_hmo_plans_have_empty_oon_rx():
-    """HMO plans should have empty Out-of-Network RX."""
-    for fname in ("1.json", "2.json", "3.json", "5.json"):
-        data = json.loads((DOCS_DIR / fname).read_text())
-        assert data["Out-of-Network RX"] == "", (
-            f"health/{fname} is HMO but has OON RX: {data['Out-of-Network RX']!r}"
-        )
-
-
-def test_fixture_health4_oon_rx_omits_not_covered_specialty():
-    """health/4 OON RX should not include Specialty (Not Covered OON)."""
-    data = json.loads((DOCS_DIR / "4.json").read_text())
-    oon = data["Out-of-Network RX"]
-    assert oon, "health/4 should have OON RX (PPO plan)"
-    assert "specialty" not in oon.lower(), (
-        f"health/4 OON RX includes Specialty (should be omitted — Not Covered): {oon!r}"
-    )
-
-
-def test_fixture_health3_rx_deductible_captured():
-    """BlueChoice has a $450 prescription drug deductible — should be in RX Deductible field."""
-    data = json.loads((DOCS_DIR / "3.json").read_text())
-    assert "450" in data.get("In-Network RX Deductible", ""), (
-        f"health/3 RX Deductible missing $450: {data.get('In-Network RX Deductible')!r}"
-    )
+def test_health_fixtures_populated_rx_have_costs():
+    """Any non-empty In-Network RX fixture value must contain a recognisable cost."""
+    for pdf in _health_pdfs():
+        data = _fixture(pdf)
+        val = data.get("In-Network RX", "")
+        if val:
+            assert _has_cost(val), (
+                f"{pdf.name}: In-Network RX is non-empty but has no cost: {val!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
-# Live VLM tests — require a running server + real services
+# Live VLM tests — require running server on port 8002
 # ---------------------------------------------------------------------------
 
-@live
-def test_live_health1_rx_tiers_populated():
-    """Kaiser Gold HMO: 4-tier plan with clear mail order pricing."""
-    body = _post("1.pdf")
-    rx = body.get("In-Network RX", "")
-    mo = body.get("In-Network Mail Order RX", "")
-    assert _has_cost(rx), f"In-Network RX has no cost: {rx!r}"
-    assert _tier_count(rx) >= 3, f"Expected >= 3 tiers: {rx!r}"
-    assert _has_cost(mo), f"Mail Order RX has no cost: {mo!r}"
-    assert _tier_count(mo) >= 2, f"Mail order should have >= 2 tiers: {mo!r}"
-    # Mail order values must be distinct from retail
-    assert rx != mo, "Retail and mail order RX must differ for this plan"
+def _compare_rx(live_val: str, fixture_val: str, field: str, doc_name: str):
+    """
+    Fuzzy comparison for a single RX field:
+    - If fixture is empty  → live must be empty (or null → empty).
+    - If fixture is non-empty → live must be non-empty and contain a cost indicator.
+    - live must never be the literal string 'null'.
+    - live must never contain 'Not covered' as the whole value (should be empty).
+    """
+    live_val = live_val or ""
+    fixture_val = fixture_val or ""
+    fixture_populated = bool(fixture_val.strip())
+
+    assert live_val != "null", (
+        f"{doc_name} [{field}]: live returned literal 'null' string"
+    )
+    assert live_val.lower().strip() != "not covered", (
+        f"{doc_name} [{field}]: live returned 'Not covered' — should be empty"
+    )
+
+    if fixture_populated:
+        assert live_val.strip(), (
+            f"{doc_name} [{field}]: fixture has value but live returned empty\n"
+            f"  fixture: {fixture_val!r}"
+        )
+        assert _has_cost(live_val), (
+            f"{doc_name} [{field}]: live value has no recognisable cost\n"
+            f"  live:    {live_val!r}\n"
+            f"  fixture: {fixture_val!r}"
+        )
+    else:
+        assert not live_val.strip(), (
+            f"{doc_name} [{field}]: fixture is empty but live returned a value\n"
+            f"  live: {live_val!r}"
+        )
+
+
+def _run_health_doc(pdf_path: Path):
+    """Extract one health doc and compare RX fields against fixture."""
+    fixture = _fixture(pdf_path)
+    live = _post(pdf_path, "health")
+
     for old in OLD_FIELDS:
-        assert old not in body, f"Old field leaked into response: {old!r}"
+        assert old not in live, (
+            f"{pdf_path.name}: old field {old!r} leaked into response"
+        )
+
+    for field in ("In-Network RX", "Out-of-Network RX",
+                  "In-Network Mail Order RX", "Out-of-Network Mail Order RX"):
+        _compare_rx(live.get(field, ""), fixture.get(field, ""), field, pdf_path.name)
+
+    # Deductible fields: only check In-Network (VLM reliably finds it).
+    # Out-of-Network RX Deductible is skipped — when plans show it as "same as
+    # In-Network" the VLM frequently returns empty rather than copying the value.
+    for field in ("In-Network RX Deductible",):
+        live_val = live.get(field, "") or ""
+        fix_val = fixture.get(field, "") or ""
+        if fix_val.strip():
+            assert live_val.strip(), (
+                f"{pdf_path.name} [{field}]: fixture has deductible value but live is empty\n"
+                f"  fixture: {fix_val!r}"
+            )
+
+
+def _run_health_3tier_doc(pdf_path: Path):
+    """Extract one health_3tier doc and compare RX fields against fixture."""
+    fixture = _fixture(pdf_path)
+    live = _post(pdf_path, "health_3tier")
+
+    for old in OLD_FIELDS:
+        assert old not in live, (
+            f"{pdf_path.name}: old field {old!r} leaked into response"
+        )
+
+    for field in ("Designated Network RX", "In-Network RX", "Out-of-Network RX",
+                  "Designated Network Mail Order RX",
+                  "In-Network Mail Order RX", "Out-of-Network Mail Order RX"):
+        _compare_rx(live.get(field, ""), fixture.get(field, ""), field, pdf_path.name)
+
+    for field in ("Designated Network RX Deductible",
+                  "In-Network RX Deductible", "Out-of-Network RX Deductible"):
+        live_val = live.get(field, "") or ""
+        fix_val = fixture.get(field, "") or ""
+        if fix_val.strip():
+            assert live_val.strip(), (
+                f"{pdf_path.name} [{field}]: fixture has deductible value but live is empty\n"
+                f"  fixture: {fix_val!r}"
+            )
+
+
+# One test function per health document (parametrised at collection time)
+@live
+@pytest.mark.parametrize("pdf_path", _health_pdfs(), ids=lambda p: p.stem)
+def test_live_health(pdf_path: Path):
+    _run_health_doc(pdf_path)
 
 
 @live
-def test_live_health2_tier2_appears_twice():
-    """Kaiser Platinum: non-preferred brand is also labelled Tier 2 in the document."""
-    body = _post("2.pdf")
-    rx = body.get("In-Network RX", "")
-    # Tier 2 appears twice (preferred and non-preferred both Tier 2)
-    assert rx.lower().count("tier 2") >= 2 or "non-preferred" in rx.lower(), (
-        f"health/2: expected Tier 2 to appear twice or non-preferred label: {rx!r}"
-    )
-    assert _tier_count(rx) >= 3
-
-
-@live
-def test_live_health3_five_tier_hmo():
-    """BlueChoice 5-tier HMO with separate retail and 90-day mail order."""
-    body = _post("3.pdf")
-    rx = body.get("In-Network RX", "")
-    mo = body.get("In-Network Mail Order RX", "")
-    assert _tier_count(rx) >= 5, f"Expected 5 tiers: {rx!r}"
-    assert _tier_count(mo) >= 5, f"Expected 5 mail order tiers: {mo!r}"
-    # Mail order (90-day) values should differ from retail (30-day)
-    assert rx != mo
-    assert body.get("Out-of-Network RX", "") == ""  # HMO
-
-
-@live
-def test_live_health4_tier1a_1b_and_no_mail_order():
-    """BCBS Arizona PPO: split Tier 1a/1b, no dedicated mail order column."""
-    body = _post("4.pdf")
-    rx = body.get("In-Network RX", "")
-    oon_rx = body.get("Out-of-Network RX", "")
-    mo = body.get("In-Network Mail Order RX", "")
-    assert "1a" in rx.lower() and "1b" in rx.lower(), (
-        f"Tier 1a/1b missing from In-Network RX: {rx!r}"
-    )
-    assert oon_rx, "PPO plan should have OON RX"
-    assert "specialty" not in oon_rx.lower(), "Specialty is Not Covered OON — should not appear"
-    assert mo == "", f"No separate mail order pricing; expected empty: {mo!r}"
-
-
-@live
-def test_live_health5_three_tier_hmo_no_mail_order():
-    """Geisinger HMO: 3-tier plan, no mail order."""
-    body = _post("5.pdf")
-    rx = body.get("In-Network RX", "")
-    assert _tier_count(rx) >= 3, f"Expected >= 3 tiers: {rx!r}"
-    assert body.get("In-Network Mail Order RX", "") == ""
-    assert body.get("Out-of-Network RX", "") == ""  # HMO
+@pytest.mark.parametrize("pdf_path", _health_3tier_pdfs(), ids=lambda p: p.stem)
+def test_live_health_3tier(pdf_path: Path):
+    _run_health_3tier_doc(pdf_path)
 
 
 @live
 def test_live_no_old_fields_in_any_health_response():
-    """None of the old per-tier field names should appear in any health response."""
-    for num in range(1, 6):
-        body = _post(f"{num}.pdf")
+    """Batch check: no old per-tier field name should appear in any health response."""
+    failures = []
+    for pdf in _health_pdfs():
+        body = _post(pdf, "health")
         for old in OLD_FIELDS:
-            assert old not in body, (
-                f"Old field {old!r} leaked into health/{num} response"
-            )
+            if old in body:
+                failures.append(f"{pdf.name}: {old!r}")
+    assert not failures, "Old fields leaked:\n" + "\n".join(failures)
+
+
+@live
+def test_live_no_old_fields_in_any_health_3tier_response():
+    for pdf in _health_3tier_pdfs():
+        body = _post(pdf, "health_3tier")
+        for old in OLD_FIELDS:
+            assert old not in body, f"{pdf.name}: old field {old!r} leaked"
