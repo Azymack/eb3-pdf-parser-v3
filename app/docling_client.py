@@ -13,32 +13,26 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
 async def convert_pdf(pdf_bytes: bytes, filename: str) -> dict:
     """POST the PDF to docling-service and return the parsed ConvertResponse dict.
 
-    Routes through the outbound proxy when USE_OUTBOUND_PROXY=true and DOCLING_PROXY_URL is set.
     Raises distinct exceptions so the caller can surface precise 502 error details:
-      - httpx.ProxyError     → proxy is unreachable
-      - httpx.ConnectError   → proxy reachable but docling-service is not
+      - httpx.ConnectError   → docling-service is not reachable
       - httpx.HTTPStatusError → docling-service returned a non-2xx response
       - ValueError           → response body is not valid JSON
     """
     settings = get_settings()
-    proxy = settings.outbound_proxy_url
     endpoint = f"{settings.DOCLING_SERVICE_URL}{settings.DOCLING_ENDPOINT}"
 
-    # Log the target path and a generic "via proxy" flag — never log the proxy URL
-    # itself since it may contain credentials.
     logger.info(
         "docling_client: sending conversion request",
         extra={
             "endpoint": endpoint,
             "filename": filename,
-            "via_proxy": proxy is not None,
             "ocr_mode": settings.DOCLING_OCR_MODE,
             "table_mode": settings.DOCLING_TABLE_MODE,
         },
     )
 
     try:
-        async with httpx.AsyncClient(proxy=proxy, timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             response = await client.post(
                 endpoint,
                 files={"file": (filename, pdf_bytes, "application/pdf")},
@@ -47,11 +41,8 @@ async def convert_pdf(pdf_bytes: bytes, filename: str) -> dict:
                     "table_mode": settings.DOCLING_TABLE_MODE,
                 },
             )
-    except httpx.ProxyError as exc:
-        logger.error("docling_client: proxy unreachable", extra={"error": str(exc)})
-        raise
     except httpx.ConnectError as exc:
-        logger.error("docling_client: docling-service unreachable (two-hop path: proxy→service)", extra={"error": str(exc)})
+        logger.error("docling_client: docling-service unreachable", extra={"error": str(exc)})
         raise
 
     if response.status_code != 200:

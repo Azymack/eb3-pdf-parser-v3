@@ -159,8 +159,6 @@ async def llm_test(
 
     try:
         content = await complete_prompt(prompt)
-    except httpx.ProxyError:
-        raise HTTPException(status_code=502, detail="Proxy unreachable — cannot reach VLM service")
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="VLM service unreachable")
     except httpx.HTTPStatusError as exc:
@@ -192,8 +190,6 @@ async def _run_pipeline(
     t0 = time.monotonic()
     try:
         docling_result = await convert_pdf(pdf_bytes, filename)
-    except httpx.ProxyError:
-        raise HTTPException(status_code=502, detail="Proxy unreachable — cannot reach docling-service")
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="docling-service unreachable")
     except httpx.HTTPStatusError as exc:
@@ -250,8 +246,6 @@ async def _run_pipeline(
             page_markdowns=selected_markdowns,
             page_images=rendered_images,
         )
-    except httpx.ProxyError:
-        raise HTTPException(status_code=502, detail="Proxy unreachable — cannot reach VLM service")
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="VLM service unreachable")
     except httpx.HTTPStatusError as exc:

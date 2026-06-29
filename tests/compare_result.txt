@@ -1,0 +1,354 @@
+  running 1780511663.pdf ...  running 1780577873 H SOB.pdf ...  running 1780607817.pdf ...  running 1780608508.pdf ...  running 1780628538.pdf ...  running 1780701837.pdf ...  running 1780702082.pdf ...  running 1781114927 Health.pdf ...  running 1781120889.pdf ...  running 1781122166.pdf ...  running 1781127742.pdf ...  running 1781127953.pdf ...  running 1781128131.pdf ...  running 1781133606.pdf ...  running 1781178383 Health.pdf ...  running 1781178497 Health.pdf ...  running 1781179438 Health.pdf ...  running 1781179757 Health.pdf ...  running 1781185111.pdf ...  running 1781204114.pdf ...  running 1781204187.pdf ...  running 1766416458.pdf ...  running 1766426938.pdf ...                                                            
+!! 1780511663.pdf  PASS=29  FAIL=3  MISS=0  EXTRA=2  SKIP=3
+  [FAIL] In-Network Major Diagnostics
+         fixture: '$100/day, then 25% coinsurance'
+         live:    '$15/day (diagnostic test), $100/day (imaging)'
+         reason:  numbers missing from live: ['25']
+  [FAIL] In-Network RX
+         fixture: 'Generic: Level 1: $10/prescription, Prescription Drug deductible does not apply '
+         live:    'Tier 1: $10/prescription (retail) / Tier 2: $50/prescription (retail) / Tier 3: '
+         reason:  numbers missing from live: ['100', '20', '40', '60']
+  [FAIL] In-Network Mail Order RX
+         fixture: '$20/prescription, Prescription Drug deductible does not apply / $125/prescriptio'
+         live:    'Tier 1: $20/prescription (home delivery) / Tier 2: $60/prescription (retail only'
+         reason:  numbers missing from live: ['125', '225', '30']
+
+!! 1780577873 H SOB.pdf  PASS=15  FAIL=2  MISS=0  EXTRA=2  SKIP=18
+  [FAIL] In-Network Outpatient Surgery
+         fixture: 'Deductible, then $300 per visit'
+         live:    'Facility: Deductible, then $500 per visit; Physician: Deductible, then $70 per v'
+         reason:  numbers missing from live: ['300']
+  [FAIL] In-Network RX
+         fixture: 'Generic: Deductible, then $15 / Brand: Deductible, then $50 / Tier 3: Deductible'
+         live:    'Generic Drugs: 30-day supply: Deductible, then $15; 90-day supply: Deductible, t'
+         reason:  numbers missing from live: ['3', '4', '5']
+
+!! 1780607817.pdf  PASS=24  FAIL=2  MISS=0  EXTRA=2  SKIP=9
+  [FAIL] Out-of-Network Inpatient Surgery
+         fixture: '50% coinsurance'
+         live:    'Not covered'
+         reason:  numbers missing from live: ['50']
+  [FAIL] In-Network Major Diagnostics
+         fixture: '$300 copay/visit; deductible does not apply'
+         live:    '$15 copay/visit (blood work), $55 copay/visit (x-rays)'
+         reason:  numbers missing from live: ['300']
+
+!! 1780608508.pdf  PASS=23  FAIL=3  MISS=0  EXTRA=2  SKIP=9
+  [FAIL] In-Network Inpatient Surgery
+         fixture: '50% coinsurance'
+         live:    'N/A (not specified in document)'
+         reason:  numbers missing from live: ['50']
+  [FAIL] Out-of-Network Inpatient Surgery
+         fixture: '50% coinsurance'
+         live:    'N/A (not specified in document)'
+         reason:  numbers missing from live: ['50']
+  [FAIL] In-Network Major Diagnostics
+         fixture: '$370 copay/visit'
+         live:    '$15 copay/visit (blood work), $60 copay/visit (x-rays)'
+         reason:  numbers missing from live: ['370']
+
+!! 1780628538.pdf  PASS=26  FAIL=6  MISS=0  EXTRA=2  SKIP=3
+  [FAIL] In-Network Newborn Delivery
+         fixture: '$150/visit plus 20% coinsurance'
+         live:    'N/A (part of childbirth services)'
+         reason:  numbers missing from live: ['150', '20']
+  [FAIL] Out-of-Network Newborn Delivery
+         fixture: '$250/visit plus 40% coinsurance'
+         live:    'N/A (part of childbirth services)'
+         reason:  numbers missing from live: ['250', '40']
+  [FAIL] In-Network Major Diagnostics
+         fixture: '20% coinsurance'
+         live:    'No Charge'
+         reason:  numbers missing from live: ['20']
+  [FAIL] Out-of-Network Major Diagnostics
+         fixture: '40% coinsurance'
+         live:    '30% coinsurance'
+         reason:  numbers missing from live: ['40']
+  [FAIL] In-Network RX
+         fixture: 'Generic: Preferred: Preferred - No Charge Participating - $10/prescription / Non'
+         live:    'Generic (Preferred): No Charge / Generic (Non-preferred): $10 / Brand (Preferred'
+         reason:  numbers missing from live: ['20', '3', '4', '5', '55', '95']
+  [FAIL] Out-of-Network RX
+         fixture: 'Generic: Preferred: $10/prescription; deductible does not apply / Non preferred:'
+         live:    'Generic (Preferred): $10 / Generic (Non-preferred): $20 / Brand (Preferred): $55'
+         reason:  numbers missing from live: ['150', '250', '3', '4', '5', '50']
+
+!! 1780701837.pdf  PASS=26  FAIL=5  MISS=1  EXTRA=3  SKIP=2
+  [FAIL] In-Network PCP Visit
+         fixture: 'Designated: $10 copay/visit / Participating: $35 copay / visit'
+         live:    'No charge (Deductible waived)'
+         reason:  numbers missing from live: ['10', '35']
+  [FAIL] Out-of-Network PCP Visit
+         fixture: '40% coinsurance'
+         live:    'Not applicable'
+         reason:  numbers missing from live: ['40']
+  [FAIL] In-Network Newborn Delivery
+         fixture: '20% coinsurance'
+         live:    'Not specified'
+         reason:  numbers missing from live: ['20']
+  [FAIL] Out-of-Network Newborn Delivery
+         fixture: '40% coinsurance'
+         live:    'Not specified'
+         reason:  numbers missing from live: ['40']
+  [MISS] Out-of-Network RX Deductible
+         fixture: 'Not applicable'
+         live:    ''
+         reason:  fixture has value, live is empty
+  [FAIL] In-Network RX
+         fixture: 'Generic: Costco/Walmart: $0 copay Cedar Clinic: $10 copay Other pharmacy: $20 co'
+         live:    'Generic: Costco/Walmart: $0 copay, Cedar Clinic: $10 copay, Other pharmacy: $20 '
+         reason:  numbers missing from live: ['3', '4']
+
+!! 1780702082.pdf  PASS=28  FAIL=1  MISS=3  EXTRA=3  SKIP=2
+  [MISS] In-Network Newborn Delivery
+         fixture: '20% coinsurance'
+         live:    ''
+         reason:  fixture has value, live is empty
+  [MISS] Out-of-Network Newborn Delivery
+         fixture: '50% coinsurance'
+         live:    ''
+         reason:  fixture has value, live is empty
+  [MISS] Out-of-Network RX Deductible
+         fixture: 'Not applicable'
+         live:    ''
+         reason:  fixture has value, live is empty
+  [FAIL] In-Network RX
+         fixture: 'Generic: Costco/Walmart: $0 copay Other pharmacy: $20 copay / Brand: $40 copay /'
+         live:    'Costco/Walmart: $0 copay / Other pharmacy: $20 copay (Deductible waived) / Brand'
+         reason:  numbers missing from live: ['3', '4']
+
+!! 1781114927 Health.pdf  PASS=29  FAIL=3  MISS=0  EXTRA=2  SKIP=3
+  [FAIL] In-Network RX
+         fixture: 'Generic: Tier 1A: $3 / Tier 1: $10 / Brand: Copay/prescription: $50 / Tier 3: Co'
+         live:    'Tier 1A: $3 (retail); Tier 1: $10 (retail); Preferred Generic Drugs: $3 (retail)'
+         reason:  numbers missing from live: ['4']
+  [FAIL] In-Network Mail Order RX
+         fixture: 'Tier 1A: $6 / Tier 1: $20 / $100 / $200'
+         live:    'Tier 1A: $6 (mail order); Tier 1: $20 (mail order)'
+         reason:  numbers missing from live: ['100', '200']
+  [FAIL] Out-of-Network RX
+         fixture: 'Generic: 50% coinsurance / Brand: 50% coinsurance / Tier 3: 50% coinsurance'
+         live:    '50% coinsurance (retail)'
+         reason:  numbers missing from live: ['3']
+
+!! 1781120889.pdf  PASS=25  FAIL=1  MISS=0  EXTRA=2  SKIP=9
+  [FAIL] In-Network RX
+         fixture: 'Generic: $10 copay, deductible does not apply / Brand: $35 copay, deductible doe'
+         live:    'Tier 1: $10 / Tier 2: $35 / Tier 3: $75 / Tier 4: $250'
+         reason:  numbers missing from live: ['150', '350', '500']
+
+!! 1781122166.pdf  PASS=25  FAIL=1  MISS=0  EXTRA=2  SKIP=9
+  [FAIL] In-Network RX
+         fixture: 'Generic: $10 copay, deductible does not apply / Brand: $35 copay, deductible doe'
+         live:    'Tier 1: $10 / Tier 2: $35 / Tier 3: $75 / Tier 4: $250'
+         reason:  numbers missing from live: ['150', '350', '500']
+
+!! 1781127742.pdf  PASS=29  FAIL=3  MISS=0  EXTRA=2  SKIP=3
+  [FAIL] In-Network RX
+         fixture: 'Generic: Tier 1A: $3 / Tier 1: $10 / Brand: Copay/prescription: $50 / Tier 3: Co'
+         live:    'Tier 1A: $3 (retail); Tier 1: $10 (retail); Preferred brand drugs: $50 (retail);'
+         reason:  numbers missing from live: ['4']
+  [FAIL] In-Network Mail Order RX
+         fixture: 'Tier 1A: $6 / Tier 1: $20 / $100 / $200'
+         live:    'Tier 1A: $6 (mail order); Tier 1: $20 (mail order)'
+         reason:  numbers missing from live: ['100', '200']
+  [FAIL] Out-of-Network RX
+         fixture: 'Generic: 50% coinsurance / Brand: 50% coinsurance / Tier 3: 50% coinsurance'
+         live:    '50% coinsurance (retail)'
+         reason:  numbers missing from live: ['3']
+
+!! 1781127953.pdf  PASS=29  FAIL=3  MISS=0  EXTRA=2  SKIP=3
+  [FAIL] In-Network RX
+         fixture: 'Generic: Tier 1A: $3 / Tier 1: $10 / Brand: Copay/ prescription, deductible does'
+         live:    'Tier 1A: $3 (retail); Tier 1: $10 (retail); Preferred Brand: $45 (retail); Non-p'
+         reason:  numbers missing from live: ['30', '4']
+  [FAIL] In-Network Mail Order RX
+         fixture: 'Tier 1A: $6 / Tier 1: $20 / $90 / $150'
+         live:    'Tier 1A: $6 (mail order); Tier 1: $20 (mail order)'
+         reason:  numbers missing from live: ['150', '90']
+  [FAIL] Out-of-Network RX
+         fixture: 'Generic: 50% coinsurance deductible does not apply / Brand: 50% coinsurance dedu'
+         live:    '50% coinsurance (retail)'
+         reason:  numbers missing from live: ['3']
+
+!! 1781128131.pdf  PASS=28  FAIL=2  MISS=0  EXTRA=3  SKIP=4
+  [FAIL] In-Network RX
+         fixture: 'Tier 1: $20 copay / Tier 2: $40 copay'
+         live:    'Covered under freestanding prescription program'
+         reason:  numbers missing from live: ['1', '2', '20', '40']
+  [FAIL] Out-of-Network RX
+         fixture: 'Tier 1: $40 copay / Tier 2: $50 copay'
+         live:    'Covered under freestanding prescription program'
+         reason:  numbers missing from live: ['1', '2', '40', '50']
+
+!! 1781133606.pdf  PASS=32  FAIL=1  MISS=0  EXTRA=4  SKIP=0
+  [FAIL] In-Network RX
+         fixture: 'Generic: $10 copay, deductible does not apply / Brand: $35 copay, deductible doe'
+         live:    'Tier 1: $10 copay / Tier 2: $35 copay / Tier 3: $75 copay / Tier 4: $250 copay'
+         reason:  numbers missing from live: ['150', '350', '500']
+
+!! 1781178383 Health.pdf  PASS=21  FAIL=9  MISS=0  EXTRA=4  SKIP=3
+  [FAIL] In-Network PCP Visit
+         fixture: 'Designated: $35 copay/visit, deductible does not apply / Non-Designated: 20% coi'
+         live:    '$35 copay/visit'
+         reason:  numbers missing from live: ['20']
+  [FAIL] In-Network Specialist Visit
+         fixture: 'Designated: $75 copay/visit / Non-Designated: 20% coinsurance'
+         live:    '$75 copay/visit'
+         reason:  numbers missing from live: ['20']
+  [FAIL] In-Network Urgent Care Visit
+         fixture: 'Designated: $100 copay/visit, deductible does not apply / Non-Designated: 20% co'
+         live:    '$100 copay/visit, deductible does not apply'
+         reason:  numbers missing from live: ['20']
+  [FAIL] In-Network Outpatient Surgery
+         fixture: 'Designated: $250 copay/visit / Non-Designated: 20% coinsurance'
+         live:    '$250 copay/visit'
+         reason:  numbers missing from live: ['20']
+  [FAIL] In-Network Inpatient Surgery
+         fixture: 'Designated: $500 copay/admission / Non-Designated: 20% coinsurance'
+         live:    '$500 copay/admission'
+         reason:  numbers missing from live: ['20']
+  [FAIL] In-Network Newborn Delivery
+         fixture: 'Designated: $500 copay/admission / Non-Designated: 20% coinsurance'
+         live:    '$500 copay/admission'
+         reason:  numbers missing from live: ['20']
+  [FAIL] In-Network Major Diagnostics
+         fixture: 'Designated: 0% coinsurance / Non-Designated: 20% coinsurance'
+         live:    '0% coinsurance'
+         reason:  numbers missing from live: ['20']
+  [FAIL] In-Network RX
+         fixture: 'Generic: Tier 1A: $3 / Tier 1: $10 / Brand: Copay/ prescription: $50 / Tier 3: C'
+         live:    'Tier 1A: $3 (retail), $6 (mail order); Tier 1: $10 (retail), $20 (mail order); P'
+         reason:  numbers missing from live: ['4']
+  [FAIL] In-Network Mail Order RX
+         fixture: 'Tier 1A: $6 / Tier 1: $20 / $100 / $160'
+         live:    'Tier 1A: $6 (mail order); Tier 1: $20 (mail order)'
+         reason:  numbers missing from live: ['100', '160']
+
+!! 1781178497 Health.pdf  PASS=30  FAIL=2  MISS=0  EXTRA=4  SKIP=1
+  [FAIL] In-Network RX
+         fixture: 'Generic: Tier 1A: $3 / Tier 1: $10 / Brand: Copay/prescription: $50 / Tier 3: Co'
+         live:    'Tier 1A: $3 (retail); Tier 1: $10 (retail); Tier 2: $50 (retail); Tier 3: $80 (r'
+         reason:  numbers missing from live: ['30', '4']
+  [FAIL] Out-of-Network RX
+         fixture: 'Generic: 50% coinsurance (retail), deductible does not apply / Brand: 50% coinsu'
+         live:    '50% coinsurance (retail)'
+         reason:  numbers missing from live: ['3']
+
+!! 1781179438 Health.pdf  PASS=29  FAIL=3  MISS=0  EXTRA=4  SKIP=1
+  [FAIL] In-Network RX
+         fixture: 'Generic: Tier 1A: $3 / Tier 1: $10 / Brand: Copay/prescription, deductible does '
+         live:    'Tier 1A: $3 (retail); Tier 1: $10 (retail); Preferred Brand: $50 (retail); Non-p'
+         reason:  numbers missing from live: ['30', '4']
+  [FAIL] In-Network Mail Order RX
+         fixture: 'Tier 1A: $6 / Tier 1: $20 / $100 / $160'
+         live:    'Tier 1A: $6 (mail order); Tier 1: $20 (mail order)'
+         reason:  numbers missing from live: ['100', '160']
+  [FAIL] Out-of-Network RX
+         fixture: 'Generic: 50% coinsurance (retail), deductible does not apply / Brand: 50% coinsu'
+         live:    '50% coinsurance'
+         reason:  numbers missing from live: ['3']
+
+!! 1781179757 Health.pdf  PASS=29  FAIL=3  MISS=0  EXTRA=4  SKIP=1
+  [FAIL] In-Network RX
+         fixture: 'Generic: Copay/prescription, deductible does not apply: Tier 1A: $3 / Tier 1: $1'
+         live:    'Tier 1A: $3 (retail), $6 (mail order); Tier 1: $10 (retail), $20 (mail order); T'
+         reason:  numbers missing from live: ['30', '4']
+  [FAIL] In-Network Mail Order RX
+         fixture: 'Tier 1A: $6 / Tier 1: $20 / $90 / $150'
+         live:    'Tier 1A: $6 (mail order); Tier 1: $20 (mail order)'
+         reason:  numbers missing from live: ['150', '90']
+  [FAIL] Out-of-Network RX
+         fixture: 'Generic: 50% coinsurance (retail), deductible does not apply / Brand: 50% coinsu'
+         live:    '50% coinsurance'
+         reason:  numbers missing from live: ['3']
+
+!! 1781185111.pdf  PASS=32  FAIL=1  MISS=0  EXTRA=2  SKIP=2
+  [FAIL] In-Network RX
+         fixture: 'Generic: $10 copay / Brand: $35 copay (Specialty Drugs: $150 copay) / Tier 3: $7'
+         live:    'Tier 1: $10 / Tier 2: $35 / Tier 3: $70 / Tier 4: $150'
+         reason:  numbers missing from live: ['350', '500']
+
+!! 1781204114.pdf  PASS=27  FAIL=3  MISS=1  EXTRA=3  SKIP=3
+  [FAIL] In-Network Outpatient Surgery
+         fixture: 'Hospital: $250 copay per visit and 40% coinsurance after deductible is met / Amb'
+         live:    '40% coinsurance after deductible is met'
+         reason:  numbers missing from live: ['250', '50']
+  [FAIL] In-Network Major Diagnostics
+         fixture: 'Freestanding: 40% coinsurance after deductible is met / Hospital: $100 copay per'
+         live:    '40% coinsurance after deductible is met'
+         reason:  numbers missing from live: ['100']
+  [FAIL] In-Network RX
+         fixture: 'Generic: Preferred: $20 copay per prescription, deductible does not apply / In-N'
+         live:    'Tier 1: $20 copay per prescription, deductible does not apply / Tier 2: $90 copa'
+         reason:  numbers missing from live: ['120', '30', '400', '80']
+  [MISS] In-Network Mail Order RX
+         fixture: '$40 copay per prescription, deductible does not apply / $200 copay per prescript'
+         live:    ''
+         reason:  fixture has value, live is empty
+
+!! 1781204187.pdf  PASS=28  FAIL=4  MISS=1  EXTRA=2  SKIP=2
+  [FAIL] In-Network Outpatient Surgery
+         fixture: 'Hospital: $250 copay per visit and 20% coinsurance after medical deductible is m'
+         live:    '20% coinsurance after medical deductible is met'
+         reason:  numbers missing from live: ['250', '50']
+  [FAIL] In-Network Major Diagnostics
+         fixture: 'Freestanding: 20% coinsurance after medical deductible is met / Hospital: $100 c'
+         live:    '20% coinsurance after medical deductible is met'
+         reason:  numbers missing from live: ['100']
+  [MISS] Out-of-Network RX Deductible
+         fixture: '$250 person / $500 family'
+         live:    ''
+         reason:  fixture has value, live is empty
+  [FAIL] In-Network RX
+         fixture: 'Generic: Preferred: $10 copay per prescription, Pharmacy deductible does not app'
+         live:    'Tier 1: $10 / Tier 2: $50 / Tier 3: $90 / Tier 4: 30% coinsurance up to $250 per'
+         reason:  numbers missing from live: ['100', '20', '40', '60']
+  [FAIL] In-Network Mail Order RX
+         fixture: '$20 copay per prescription, Pharmacy deductible does not apply / $125 copay per '
+         live:    'Tier 1: $20 / Tier 2: $125 / Tier 3: $225 / Tier 4: 40% coinsurance up to $250 p'
+         reason:  numbers missing from live: ['30']
+
+!! 1766416458.pdf  PASS=45  FAIL=2  MISS=1  EXTRA=2  SKIP=4
+  [FAIL] In-Network Urgent Care Visit
+         fixture: '$30 copay per visit, deductible does not apply'
+         live:    '$50 copay per visit'
+         reason:  numbers missing from live: ['30']
+  [FAIL] Out-of-Network ER Visit
+         fixture: '40% coinsurance'
+         live:    '$250 copay per visit, After copay, 20% coinsurance'
+         reason:  numbers missing from live: ['40']
+  [MISS] Out-of-Network Preventive visit
+         fixture: '40% coinsurance'
+         live:    ''
+         reason:  fixture has value, live is empty
+
+!! 1766426938.pdf  PASS=41  FAIL=4  MISS=2  EXTRA=2  SKIP=5
+  [FAIL] Designated Network Single Deductible
+         fixture: '$0'
+         live:    '$2,000'
+         reason:  numbers missing from live: ['0']
+  [FAIL] Designated Network Family Deductible
+         fixture: '$0'
+         live:    '$4,000'
+         reason:  numbers missing from live: ['0']
+  [FAIL] Designated Network Single OOP Max
+         fixture: '$0'
+         live:    '$5,000'
+         reason:  numbers missing from live: ['0']
+  [FAIL] Designated Network Family OOP Max
+         fixture: '$0'
+         live:    '$10,000'
+         reason:  numbers missing from live: ['0']
+  [MISS] Out-of-Network Preventive visit
+         fixture: '50% coinsurance'
+         live:    ''
+         reason:  fixture has value, live is empty
+  [MISS] Designated Network Mail Order RX
+         fixture: '$30/prescription, deductible does not apply / $113/prescription, deductible does'
+         live:    ''
+         reason:  fixture has value, live is empty
+
+============================================================
+TOTAL  PASS=650  FAIL=67  MISS=9  EXTRA=60  SKIP=99
+Accuracy (PASS / checked): 89.5%

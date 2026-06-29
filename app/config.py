@@ -5,12 +5,6 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     DOCLING_SERVICE_URL: str = "http://129.212.178.134:8001"
-    # When true, route docling-service and VLM through DOCLING_PROXY_URL (dev / non-allowlisted hosts).
-    # Set false in production when this host can reach services directly.
-    USE_OUTBOUND_PROXY: bool = False
-    # Full proxy URL including credentials if needed: http://user:pass@host:port
-    # Only used when USE_OUTBOUND_PROXY=true. Never commit a real value.
-    DOCLING_PROXY_URL: str | None = None
     # Which docling endpoint to use (/convert or /convert-gpu)
     DOCLING_ENDPOINT: str = "/convert-gpu"
     DOCLING_OCR_MODE: str = "auto"
@@ -26,12 +20,6 @@ class Settings(BaseSettings):
 
     VLM_BASE_URL: str = "http://129.212.178.134"
     VLM_MODEL: str = "default-vlm-model"
-
-    @property
-    def outbound_proxy_url(self) -> str | None:
-        if not self.USE_OUTBOUND_PROXY:
-            return None
-        return self.DOCLING_PROXY_URL
 
     @property
     def api_key_set(self) -> set[str]:
