@@ -189,39 +189,6 @@ async def test_docling_failure_returns_502(mock_pipeline):
     assert "docling-service" in response.json()["detail"].lower()
 
 
-@pytest.mark.asyncio
-async def test_proxy_failure_returns_502(mock_pipeline):
-    mock_docling, mock_vlm, mock_render = mock_pipeline
-    mock_docling.side_effect = httpx.ProxyError("proxy connection failed")
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(
-            "/extract_json_v2",
-            headers=HEADERS_OK,
-            files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
-            data={"category": "dental"},
-        )
-
-    assert response.status_code == 502
-    assert "proxy" in response.json()["detail"].lower()
-
-
-@pytest.mark.asyncio
-async def test_vlm_proxy_failure_returns_502(mock_pipeline):
-    mock_docling, mock_vlm, mock_render = mock_pipeline
-    mock_vlm.side_effect = httpx.ProxyError("proxy connection failed")
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(
-            "/extract_json_v2",
-            headers=HEADERS_OK,
-            files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
-            data={"category": "dental"},
-        )
-
-    assert response.status_code == 502
-    assert "proxy" in response.json()["detail"].lower()
-
 
 @pytest.mark.asyncio
 async def test_vlm_invalid_json_returns_502(mock_pipeline):

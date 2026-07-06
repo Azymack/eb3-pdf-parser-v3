@@ -2,6 +2,18 @@
 
 Uses guided_json decoding to constrain the response to the category's field schema,
 eliminating post-hoc JSON repair.
+
+System prompt composition
+-------------------------
+Rather than one monolithic prompt for every category, the system prompt is
+assembled from three blocks:
+
+  _BASE_PROMPT          — universal extraction instructions (all categories)
+  _SINGLE_COLUMN_PROMPT — in/out-of-network table guidance (dental, vision, health, health_3tier)
+  _RX_PROMPT            — prescription drug field guidance (health, health_3tier only)
+
+Adding category-specific guidance in future is a one-line change to the
+relevant frozenset plus a new prompt constant.
 """
 import json
 import logging
@@ -15,6 +27,120 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=5.0)
 
+# ---------------------------------------------------------------------------
+# Prompt composition constants
+# ---------------------------------------------------------------------------
+
+# Categories that have per-service In-Network / Out-of-Network cost columns.
+_NETWORK_TABLE_CATEGORIES: frozenset[str] = frozenset({
+    "dental", "vision", "health", "health_3tier",
+})
+
+# Categories that have prescription drug RX fields.
+_RX_CATEGORIES: frozenset[str] = frozenset({
+    "health", "health_3tier",
+})
+
+# Block 1 — universal (all categories).
+# {display_category} is filled in at build time.
+_BASE_PROMPT = (
+    "You are an insurance document extraction specialist. "
+    "Extract the specified fields from the provided {display_category} insurance plan document. "
+    "Use null for any field not present or not applicable. "
+    "List uncertain or ambiguous fields in low_confidence_fields. "
+    "You MUST respond with ONLY valid JSON — no markdown, no explanation, no code fences. "
+    "Start your response with {{ and end with }}."
+)
+
+# Block 2 — in/out-of-network single-column table guidance.
+# Relevant for categories that have separate In-Network and Out-of-Network fields
+# (dental, vision, health, health_3tier).
+_SINGLE_COLUMN_PROMPT = (
+    "\n\nIMPORTANT — single-column benefit tables: Some insurance documents present benefit "
+    "sections (e.g., Preventive Services, Basic Services, Major Services) with a SINGLE "
+    "'What You Pay' column rather than separate In-Network and Out-of-Network columns. "
+    "This layout means the stated cost applies equally to BOTH networks. "
+    "When a benefit section has only one cost column and the document elsewhere shows "
+    "out-of-network deductible or annual maximum values (confirming OON coverage exists), "
+    "populate BOTH the In-Network AND the Out-of-Network fields for each benefit row "
+    "with that same single value. "
+    "Do NOT leave Out-of-Network blank just because no separate Out-of-Network column "
+    "is visible in the service table — check whether the plan has OON cost-share details "
+    "and, if so, treat a missing OON service column as 'same as In-Network'."
+)
+
+# Block 3 — prescription drug RX field guidance.
+# ONLY for health and health_3tier. Never sent to dental, vision, std, ltd, etc.
+_RX_PROMPT = (
+    "\n\nIMPORTANT — RX fields: two supply channels.\n\n"
+    "RETAIL / 30-DAY SUPPLY → In-Network RX, Out-of-Network RX, Designated Network RX.\n"
+    "  Format: 'Label: cost' per tier separated by ' / ', using the carrier's own tier labels exactly.\n"
+    "  Example: 'Tier 1 (Generic): $10 / Tier 2 (Preferred Brand): $45 / Tier 3 (Non-preferred): $65'\n\n"
+    "MAIL ORDER / EXTENDED SUPPLY → In-Network Mail Order RX, Out-of-Network Mail Order RX, "
+    "Designated Network Mail Order RX.\n"
+    "  Format: cost values ONLY separated by ' / ', NO tier labels, in the same tier order as the retail field.\n"
+    "  Example: '$25 / $90 / $130'  <- three tiers, cost values only, no labels.\n"
+    "  Identifying mail order: look for 'mail order', 'mail-order service', '90-day supply', "
+    "'90-day fill', '100-day supply', or a dedicated mail order column.\n"
+    "  When a document cell shows both retail and mail-order in the same cell "
+    "(e.g. '$10 / $25 per fill' or '$10 retail / $25 mail'), put the 30-day cost in the Retail field "
+    "and the extended-supply cost in the Mail Order field.\n"
+    "  If no separate mail-order/extended-supply pricing exists for a network direction, return empty string "
+    "(not null, not 'Not covered') for that Mail Order field. "
+    "Do NOT copy retail costs into Mail Order fields as a substitute.\n\n"
+    "LIST-FORMAT RX and MULTI-PAGE COLLECTION: Some documents list prescription tiers as individual "
+    "rows rather than a column-based table. Each row names a specific tier AND a supply channel, e.g.:\n"
+    "  'Most generic items (Tier 1) at a Plan Pharmacy ... $20 (30-day)'  <- retail row\n"
+    "  'Most generic items (Tier 1) refills through our mail-order service ... $40 (100-day)'  <- mail order row\n"
+    "  'Most brand-name items (Tier 2) at a Plan Pharmacy ... $100 (30-day)'  <- retail row\n"
+    "In this format:\n"
+    "  - Rows containing 'at a Plan Pharmacy', 'retail pharmacy', '30-day supply', or similar "
+    "are RETAIL rows -> collect their tier labels and costs into the Retail RX field.\n"
+    "  - Rows containing 'mail-order service', 'mail order', '90-day', '100-day', or similar "
+    "are MAIL ORDER rows -> collect their costs (no labels) into the Mail Order RX field.\n"
+    "  - CRITICAL: RX sections often span multiple pages with a '(continues)' marker at the bottom. "
+    "You MUST scan ALL provided pages and collect every retail row and every mail-order row "
+    "regardless of which page they appear on. Do not stop at a page boundary.\n\n"
+    "EMPTY vs NOT COVERED: If drugs are entirely not covered for a network, return empty string -- "
+    "never write 'Not covered'. NEVER write 'null' as a string value. "
+    "Omit individual tiers that explicitly say 'Not covered' but keep the field populated "
+    "with the remaining covered tiers.\n\n"
+    "Example -- 4-tier PPO with separate retail (30-day) and mail-order (90-day) columns:\n"
+    "  In-Network RX = 'Tier 1 (Generic): $10 / Tier 2 (Preferred Brand): $45 / "
+    "Tier 3 (Non-preferred): $65 / Tier 4 (Specialty): 50% up to $150'\n"
+    "  In-Network Mail Order RX = '$20 / $90 / $130'  (cost-only, 90-day prices, no labels)\n"
+    "  Out-of-Network RX = '' (OON drugs not covered)  Out-of-Network Mail Order RX = ''\n\n"
+    "Example -- 5-tier HMO with single cost column (no separate mail order section):\n"
+    "  In-Network RX = 'Generic: $15 / Preferred Brand: Deductible, then $50 / "
+    "Non-preferred Brand: Deductible, then $75 / Preferred Specialty: Deductible, then 50% up to $100 / "
+    "Non-preferred Specialty: Deductible, then 50% up to $150'\n"
+    "  In-Network Mail Order RX = ''  (no 90-day column found)\n\n"
+    "Example -- 3-tier plan where only Designated Network has mail order:\n"
+    "  Designated Network Mail Order RX = '$25 / $75 / $125'  (cost-only, no labels)\n"
+    "  In-Network Mail Order RX = ''  (no In-Network mail order benefit shown)\n\n"
+    "Example -- list-format plan spanning two pages (each tier is a separate row):\n"
+    "  Page 1 rows: Tier 1 at pharmacy $20/30-day | Tier 1 mail-order $40/100-day | "
+    "Tier 2 at pharmacy $100/30-day | (continues)\n"
+    "  Page 2 rows: Tier 2 mail-order $200/100-day | Tier 4 at pharmacy 20% coinsurance/30-day\n"
+    "  -> In-Network RX = 'Tier 1 (Generic): $20 / Tier 2 (Brand): $100 / "
+    "Tier 4 (Specialty): 20% Coinsurance'  (ALL retail rows from ALL pages)\n"
+    "  -> In-Network Mail Order RX = '$40 / $200'  (ALL mail-order rows from ALL pages, cost-only)"
+)
+
+
+def _build_system_prompt(category: str, display_category: str) -> str:
+    """Compose a category-appropriate system prompt from the relevant blocks."""
+    parts = [_BASE_PROMPT.format(display_category=display_category)]
+    if category in _NETWORK_TABLE_CATEGORIES:
+        parts.append(_SINGLE_COLUMN_PROMPT)
+    if category in _RX_CATEGORIES:
+        parts.append(_RX_PROMPT)
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Schema and message builders
+# ---------------------------------------------------------------------------
 
 async def _chat_completion(messages: list[dict], *, extra_body: dict | None = None) -> str:
     """POST to the VLM chat completions endpoint and return message content."""
@@ -100,66 +226,14 @@ def _build_messages(
     fields_list = "\n".join(f"- {f}" for f in field_names)
     display_category = category.replace("_", " ")
 
-    system_prompt = (
-        f"You are an insurance document extraction specialist. "
-        f"Extract the specified fields from the provided {display_category} insurance plan document. "
-        f"Use null for any field not present or not applicable. "
-        f"List uncertain or ambiguous fields in low_confidence_fields. "
-        f"You MUST respond with ONLY valid JSON — no markdown, no explanation, no code fences. "
-        f"Start your response with {{ and end with }}.\n\n"
-        f"IMPORTANT — single-column benefit tables: Some insurance documents present benefit "
-        f"sections (e.g., Preventive Services, Basic Services, Major Services) with a SINGLE "
-        f"'What You Pay' column rather than separate In-Network and Out-of-Network columns. "
-        f"This layout means the stated cost applies equally to BOTH networks. "
-        f"When a benefit section has only one cost column and the document elsewhere shows "
-        f"out-of-network deductible or annual maximum values (confirming OON coverage exists), "
-        f"populate BOTH the In-Network AND the Out-of-Network fields for each benefit row "
-        f"with that same single value. "
-        f"Do NOT leave Out-of-Network blank just because no separate Out-of-Network column "
-        f"is visible in the service table — check whether the plan has OON cost-share details "
-        f"and, if so, treat a missing OON service column as 'same as In-Network'.\n\n"
-        f"IMPORTANT — RX tier fields (In-Network RX, Out-of-Network RX, "
-        f"In-Network Mail Order RX, Out-of-Network Mail Order RX, and Designated Network variants): "
-        f"These fields capture ALL prescription drug tiers in a single string. "
-        f"List every tier the carrier shows for that network direction, separated by ' / '. "
-        f"Use the format 'Label: cost' for each tier, using the carrier's own tier labels exactly "
-        f"(e.g. 'Tier 1 (Generic)', 'Preferred Brand', 'Non-preferred Brand', 'Tier 1a', 'Specialty'). "
-        f"RETAIL vs MAIL ORDER separation: For the Retail RX field use ONLY the retail/30-day cost per tier. "
-        f"For the Mail Order RX field use ONLY the mail-order/90-day cost per tier. "
-        f"When a table row shows both retail and mail-order costs in the same cell or row, "
-        f"put only the retail cost in the Retail RX field and only the mail-order cost in the Mail Order RX field — "
-        f"never include both in the same field. "
-        f"If the document shows no separate mail-order pricing column or section for a given network direction, "
-        f"return empty string (not null, not 'Not covered') for that network's Mail Order RX field. "
-        f"Do NOT copy retail costs into the Mail Order RX field as a substitute. "
-        f"EMPTY vs NOT COVERED: If an entire network direction has no drug benefit "
-        f"(drugs are simply not covered for that network), return empty string for that network's RX field — "
-        f"do not write 'Not covered' as the field value. "
-        f"NEVER write the word 'null' as a string value — use empty string instead. "
-        f"Omit individual tiers that explicitly say 'Not covered' but keep the field populated "
-        f"with the remaining covered tiers. "
-        f"Example — 4-tier PPO, retail/mail-order columns are separate: "
-        f"In-Network RX = 'Tier 1 (Generic): $10 / Tier 2 (Preferred Brand): $45 / "
-        f"Tier 3 (Non-preferred): $65 / Tier 4 (Specialty): 50% up to $150' "
-        f"In-Network Mail Order RX = 'Tier 1: $20 / Tier 2: $90 / Tier 3: $130' "
-        f"Out-of-Network RX = '' (empty — OON drugs not covered) "
-        f"Out-of-Network Mail Order RX = '' (empty). "
-        f"Example — 5-tier HMO with single cost column (no separate mail order): "
-        f"In-Network RX = 'Generic: $15 / Preferred Brand: Deductible, then $50 / "
-        f"Non-preferred Brand: Deductible, then $75 / Preferred Specialty: Deductible, then 50% up to $100 / "
-        f"Non-preferred Specialty: Deductible, then 50% up to $150' "
-        f"In-Network Mail Order RX = '' (empty — no separate mail order column). "
-        f"Example — 3-tier plan where only Designated Network has mail order (In-Network does not): "
-        f"Designated Network Mail Order RX = 'Tier 1: $25 / Tier 2: $75 / Tier 3: $125' "
-        f"In-Network Mail Order RX = '' (empty — no In-Network mail order benefit shown)."
-    )
+    system_prompt = _build_system_prompt(category, display_category)
 
     user_text = (
         f"Extract all fields for this {display_category} insurance plan.\n\n"
         f"**Fields to extract:**\n{fields_list}\n\n"
         f"**Document text (per page):**\n\n{markdown_sections}\n\n"
-        f'Return ONLY raw JSON with this exact structure: '
-        f'{{"fields": {{"Field Name": "value or null", ...}}, "low_confidence_fields": ["Field Name", ...]}}'
+        'Return ONLY raw JSON with this exact structure: '
+        '{"fields": {"Field Name": "value or null", ...}, "low_confidence_fields": ["Field Name", ...]}'
     )
 
     content: list[dict] = [{"type": "text", "text": user_text}]
@@ -185,8 +259,7 @@ async def extract_fields(
     """Call the VLM and return {"fields": {...}, "low_confidence_fields": [...]}.
 
     Raises:
-        httpx.ProxyError: proxy is unreachable
-        httpx.ConnectError: proxy reachable but VLM service is not
+        httpx.ConnectError: VLM service is not reachable
         httpx.HTTPStatusError: VLM returned non-2xx
         ValueError: response content is not parseable JSON
     """

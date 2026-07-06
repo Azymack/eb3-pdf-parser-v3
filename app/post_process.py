@@ -1,25 +1,32 @@
 """Post-extraction field normalization and computation.
 
-Two passes happen after VLM extraction:
+Three passes happen after VLM extraction:
 
 Pass 1 — Normalization (RX field cleanup):
   1. "Not covered" whole-field values → empty string.
   2. Out-of-Network RX fields → empty for HMO/EPO plans.
 
 Pass 2 — Computed fields (derived, never sent to VLM):
-  The per-tier RX fields (In-Network Generic RX, In-Network Brand RX, etc.)
-  are computed by splitting the consolidated In-Network RX / Out-of-Network RX
-  strings into positional tiers.
+  The per-tier RX fields are computed from the consolidated In-Network RX /
+  Out-of-Network RX strings using LABEL-BASED mapping (not positional).
 
-  Tier mapping (positional, 0-indexed within the consolidated string):
-    0 → Generic RX
-    1 → Brand RX
-    2 → Tier 3 RX
-    3 → Tier 4 RX
-    4 → Tier 5 RX
+Pass 3 — Mail Order RX label stripping:
+  Mail Order RX fields display 90-day costs as plain values only ("$20 / $80"),
+  not as "Label: cost" pairs.  Any labels the VLM included are stripped here.
 
-  The label prefix ("Generic: ", "Tier 1 (Generic): ", etc.) is stripped;
-  only the cost portion is kept in each per-tier field.
+  Tier assignment rules (in priority order):
+    Non-Preferred Brand  → Tier 3 RX  (ALWAYS, even if doc numbers it Tier 2)
+    Non-Preferred Generic → Brand RX   (Tier 2 in split-generic plans)
+    Non-Preferred Specialty → Tier 5 RX
+    Specialty / Preferred Specialty → Tier 4 RX
+    Generic / Preferred Generic → Generic RX (Tier 1)
+    Brand / Preferred Brand → Brand RX (Tier 2)
+    Bare "Tier N" labels without a descriptor → positional by number
+
+  This means a document that skips Preferred Brand entirely and only has
+  Generic + Non-Preferred Brand + Specialty produces:
+    Generic RX=$X, Brand RX="", Tier 3 RX=$Y, Tier 4 RX=$Z
+  rather than the wrong positional: Generic=$X, Brand=$Y, Tier 3=$Z.
 """
 from __future__ import annotations
 import re
@@ -56,13 +63,20 @@ _OON_RX_FIELDS: frozenset[str] = frozenset({
 
 _HMO_EPO_NETWORKS: frozenset[str] = frozenset({"hmo", "epo"})
 
-# Positional mapping: index → per-tier field suffix
+# Mail Order RX fields — display as cost-values only ("$20 / $80"), no tier labels.
+_MAIL_ORDER_RX_FIELDS: frozenset[str] = frozenset({
+    "In-Network Mail Order RX",
+    "Out-of-Network Mail Order RX",
+    "Designated Network Mail Order RX",
+})
+
+# Positional mapping: 0-based index → per-tier field suffix
 _TIER_SUFFIXES: tuple[str, ...] = (
-    "Generic RX",
-    "Brand RX",
-    "Tier 3 RX",
-    "Tier 4 RX",
-    "Tier 5 RX",
+    "Generic RX",    # index 0 — Tier 1
+    "Brand RX",      # index 1 — Tier 2
+    "Tier 3 RX",     # index 2
+    "Tier 4 RX",     # index 3
+    "Tier 5 RX",     # index 4
 )
 
 
@@ -71,65 +85,199 @@ def vlm_field_names(field_names: list[str]) -> list[str]:
     return [f for f in field_names if f not in COMPUTED_FIELD_NAMES]
 
 
-def _split_tiers(consolidated: str) -> list[str]:
-    """Split a consolidated RX string into per-tier cost values.
+# ── Label-based tier mapping ──────────────────────────────────────────────────
 
-    Two normalization steps before splitting:
-    1. Semicolons used as tier separators (e.g. '; Preferred Brand Drugs: ')
-       are replaced with ' / ' so both separator styles are handled uniformly.
-       Semicolons inside values (e.g. '; 90-day supply: ', '; maintenance...')
-       are left alone — they won't match because the word after the semicolon
-       either starts with a digit or lacks a colon-space suffix.
-    2. Only parts with an alphabetic label prefix are kept (e.g. 'Tier 1: $10',
-       'Generic: $15').  Bare value fragments like '$20 (mail order)' that the
-       VLM sometimes embeds after the retail cost are skipped.
+def _label_to_tier_index(label: str) -> int | None:
+    """Map a drug tier label string to a 0-based tier index.
+
+    Returns:
+        0  Generic RX   (Tier 1)
+        1  Brand RX     (Tier 2)
+        2  Tier 3 RX    (Non-Preferred Brand — ALWAYS here regardless of doc numbering)
+        3  Tier 4 RX    (Specialty / Preferred Specialty)
+        4  Tier 5 RX    (Non-Preferred Specialty)
+        None  — label unrecognized; caller decides what to do
+
+    Priority order matters: Non-Preferred Brand is checked before Brand so that
+    a label like "Non-Preferred Brand Drugs" doesn't accidentally match the
+    generic 'brand' check.
     """
-    if not consolidated:
-        return []
-    normalized = _TIER_SEMICOLON.sub(" / ", consolidated)
-    tiers = []
+    # Normalize: lowercase, collapse whitespace
+    n = re.sub(r'\s+', ' ', label.lower().strip())
+    # Strip "drugs" suffix ("Generic Drugs" → "Generic")
+    n = re.sub(r'\s+drugs?$', '', n).strip()
+    # Strip bare parenthetical tier numbers "(tier N)" — they carry no semantic info
+    # beyond what the label text already says, e.g. "Tier 1 (Generic)" → "tier 1 generic"
+    # Leave "(preferred)" / "(non-preferred)" etc. since they carry meaning.
+    n = re.sub(r'\s*\(tier\s*\d+\)\s*', ' ', n).strip()
+    n = re.sub(r'\s{2,}', ' ', n)
+
+    # ── Priority 1: Non-Preferred Brand → ALWAYS Tier 3 ──────────────────────
+    # Catches: "Non-Preferred Brand", "Non-Preferred Brand Drugs",
+    #          "Tier 2 (Non-Preferred Brand)", "Non Preferred Brand"
+    if re.search(r'non.preferred\s+brand', n):
+        return 2
+
+    # ── Priority 2: Non-Preferred Generic → Tier 2 ───────────────────────────
+    # Occurs in plans that split generics into Preferred/Non-Preferred.
+    # Must be checked before the generic catch-all below.
+    if re.search(r'non.preferred\s+generic', n):
+        return 1
+
+    # ── Priority 3: Non-Preferred Specialty → Tier 5 ─────────────────────────
+    # Catches: "Non-Preferred Specialty", "Specialty (Non-Preferred)"
+    if re.search(r'non.preferred\s+specialty', n) or (
+        'specialty' in n and re.search(r'non.preferred', n)
+    ):
+        return 4
+
+    # ── Tier 5 by number ─────────────────────────────────────────────────────
+    if re.fullmatch(r'tier\s*5', n):
+        return 4
+
+    # ── Specialty (anything remaining with "specialty") → Tier 4 ─────────────
+    # Catches: "Specialty", "Preferred Specialty", "Specialty Drugs",
+    #          "Typically Preferred Specialty"
+    if 'specialty' in n:
+        return 3
+
+    # ── Tier 4 by number or alias ─────────────────────────────────────────────
+    if re.fullmatch(r'tier\s*4', n) or n in (
+        'tier 4 - typically preferred specialty',
+        'tier 4 – typically preferred specialty',
+        'typically preferred specialty',
+        'preferred specialty',
+    ):
+        return 3
+
+    # ── Generic → Tier 1 ─────────────────────────────────────────────────────
+    # Catches: "Generic", "Preferred Generic", "Generic (Tier 1)"
+    # Must come AFTER non-preferred generic check above.
+    if 'generic' in n:
+        return 0
+
+    # ── Tier 1 by number or alias ─────────────────────────────────────────────
+    if re.fullmatch(r'tier\s*1[a-z]?', n) or n in (
+        'tier 1 - typically generic',
+        'tier 1 – typically generic',
+    ):
+        return 0
+
+    # ── Brand → Tier 2 ───────────────────────────────────────────────────────
+    # Catches: "Brand", "Brand Name", "Preferred Brand", "Brand Name Drugs"
+    # Must come AFTER non-preferred brand check above.
+    if 'brand' in n:
+        return 1
+
+    # ── Tier 2 by number or alias ─────────────────────────────────────────────
+    if re.fullmatch(r'tier\s*2', n) or n in (
+        'tier 2 - typically preferred brand',
+        'tier 2 – typically preferred brand',
+    ):
+        return 1
+
+    # ── Tier 3 by number or alias ─────────────────────────────────────────────
+    if re.fullmatch(r'tier\s*3', n) or n in (
+        'tier 3 - typically non-preferred brand',
+        'tier 3 – typically non-preferred brand',
+    ):
+        return 2
+
+    return None  # unrecognized
+
+
+def _strip_tier_labels(value: str) -> str:
+    """Strip tier labels from a mail-order RX value string.
+
+    Converts 'Tier 1: $20 / Tier 2: $80 / Tier 3: $130' → '$20 / $80 / $130'.
+    Values already in cost-only format are returned unchanged.
+    Empty strings are passed through as-is.
+
+    Semicolons used as tier separators are normalised to ' / ' first.
+    """
+    if not value:
+        return value
+    normalized = _TIER_SEMICOLON.sub(" / ", value)
+    parts = []
     for part in normalized.split(" / "):
         part = part.strip()
         if not part:
             continue
         if ": " in part:
-            label = part.split(": ", 1)[0]
-            if label and label[0].isalpha():
-                tiers.append(part.split(": ", 1)[1])
-    return tiers
+            _, _, cost = part.partition(": ")
+            parts.append(cost.strip())
+        else:
+            parts.append(part)
+    return " / ".join(parts)
 
 
-def _tier_cost(consolidated: str, index: int) -> str:
-    tiers = _split_tiers(consolidated)
-    return tiers[index] if index < len(tiers) else ""
+def _extract_tier_values(consolidated: str) -> dict[int, str]:
+    """Parse a consolidated RX string into {tier_index: cost_value}.
+
+    Uses label-based mapping via _label_to_tier_index.  Entries whose labels
+    cannot be mapped are skipped rather than placed positionally — assigning an
+    unknown label to the wrong tier is worse than leaving the slot empty.
+
+    First labeled match per slot wins (guards against duplicate tier entries
+    the VLM occasionally emits).
+    """
+    if not consolidated:
+        return {}
+
+    normalized = _TIER_SEMICOLON.sub(" / ", consolidated)
+    result: dict[int, str] = {}
+
+    for part in normalized.split(" / "):
+        part = part.strip()
+        if not part or ": " not in part:
+            continue
+        label, _, value = part.partition(": ")
+        label = label.strip()
+        value = value.strip()
+        if not label or not label[0].isalpha():
+            continue
+
+        tier_idx = _label_to_tier_index(label)
+        if tier_idx is not None and tier_idx not in result:
+            result[tier_idx] = value
+
+    return result
 
 
 def apply_post_processing(
     fields: dict[str, str | None],
-    output_field_names: list[str],  # noqa: ARG001
+    output_field_names: list[str],
 ) -> dict[str, str | None]:
     """Normalize RX fields and compute per-tier derived fields."""
     result = dict(fields)
 
-    # Pass 1a: "Not covered" / "null" whole-field → empty string for any RX field.
+    # Pass 1a: "Not covered" / "null" whole-field -> empty string for any RX field.
     for key, val in result.items():
         if "RX" in key and isinstance(val, str):
             if val.strip().lower() in _NOT_COVERED_PHRASES:
                 result[key] = ""
 
-    # Pass 1b: HMO/EPO plans have no OON drug benefit — clear OON RX fields.
+    # Pass 1b: HMO/EPO plans have no OON drug benefit -- clear OON RX fields.
     network_type = (result.get("Network Type") or "").strip().lower()
     if any(net in network_type for net in _HMO_EPO_NETWORKS):
         for field in _OON_RX_FIELDS:
             if field in result:
                 result[field] = ""
 
-    # Pass 2: compute per-tier fields from consolidated strings.
+    # Pass 2: compute per-tier fields using label-based mapping.
     for net_prefix in ("In-Network", "Out-of-Network"):
         consolidated = result.get(f"{net_prefix} RX") or ""
+        tier_values = _extract_tier_values(consolidated)
         for i, suffix in enumerate(_TIER_SUFFIXES):
             field_name = f"{net_prefix} {suffix}"
             if field_name in output_field_names:
-                result[field_name] = _tier_cost(consolidated, i)
+                result[field_name] = tier_values.get(i, "")
+
+    # Pass 3: strip tier labels from Mail Order RX fields.
+    # Mail Order fields display 90-day costs as "$20 / $80", not "Tier 1: $20 / Tier 2: $80".
+    for field in _MAIL_ORDER_RX_FIELDS:
+        val = result.get(field)
+        if isinstance(val, str) and val:
+            result[field] = _strip_tier_labels(val)
 
     return result
