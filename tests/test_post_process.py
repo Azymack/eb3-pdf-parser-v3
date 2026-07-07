@@ -337,3 +337,74 @@ class TestMailOrderStrippedByPostProcessing:
         }
         result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
         assert result["In-Network Mail Order RX"] == "$25 / $80"
+
+
+class TestThreeColumnRxContinuation:
+    """_extract_tier_values continuation logic for 3-column pharmacy tables.
+
+    A 3-column table (Preferred Network | In-Network | Out-of-Network) is
+    ingested by the VLM as 'Label: pref_cost / inn_cost' per tier, i.e. one
+    labeled part followed by one unlabeled part.  The continuation logic must
+    append the unlabeled cost to the previous tier's value.
+    """
+
+    def test_basic_two_tier_continuation(self):
+        """Each tier gets two costs merged by ' / '."""
+        tv = _extract_tier_values(
+            "Tier 1 (Generic): $20 / $20 / Tier 2 (Preferred Brand): $80 / $90"
+        )
+        assert tv[0] == "$20 / $20"
+        assert tv[1] == "$80 / $90"
+
+    def test_four_tier_anthem_style(self):
+        """Full Anthem Bronze PPO pattern: 4 tiers, each with two in-network costs."""
+        tv = _extract_tier_values(
+            "Tier 1 (Generic): $20 / $20 / "
+            "Tier 2 (Preferred Brand): $80 / $90 / "
+            "Tier 3 (Non-Preferred Brand): $120 / $130 / "
+            "Tier 4 (Specialty): 30% up to $400 / 40% up to $500"
+        )
+        assert tv[0] == "$20 / $20"       # Generic
+        assert tv[1] == "$80 / $90"       # Preferred Brand → Tier 2
+        assert tv[2] == "$120 / $130"     # Non-Preferred Brand → always Tier 3
+        assert tv[3] == "30% up to $400 / 40% up to $500"  # Specialty → Tier 4
+
+    def test_continuation_stops_at_next_label(self):
+        """Unlabeled part is only appended to the immediately preceding mapped tier."""
+        tv = _extract_tier_values(
+            "Generic: $20 / $20 / Brand: $80 / $90 / Non-Preferred Brand: $120"
+        )
+        assert tv[0] == "$20 / $20"
+        assert tv[1] == "$80 / $90"
+        assert tv[2] == "$120"            # Non-Preferred Brand — no trailing unlabeled part
+
+    def test_continuation_does_not_add_to_duplicate_label(self):
+        """When a tier slot is already occupied the duplicate is dropped and
+        continuation tracking resets, so the subsequent unlabeled part is ignored."""
+        tv = _extract_tier_values(
+            "Generic: $10 / Generic: $15 / $20"
+        )
+        assert tv[0] == "$10"    # first Generic wins
+        assert len(tv) == 1      # duplicate dropped; $20 has no target
+
+    def test_unrecognized_label_resets_continuation(self):
+        """An unrecognized label clears the continuation anchor.
+        The unlabeled part after it must NOT be appended to the previous tier."""
+        tv = _extract_tier_values(
+            "Generic: $10 / Unknown Drug Class: $50 / $99 / Brand: $40"
+        )
+        assert tv[0] == "$10"
+        assert tv[1] == "$40"
+        assert len(tv) == 2      # $50 and $99 both discarded
+
+    def test_no_continuation_in_normal_two_column_table(self):
+        """Standard 2-column table: each tier has exactly one cost — no trailing
+        unlabeled parts, so continuation logic is inert."""
+        tv = _extract_tier_values(
+            "Tier 1 (Generic): $10 / Tier 2 (Brand): $40 / "
+            "Tier 3 (Non-Preferred Brand): $65 / Tier 4 (Specialty): 50% up to $150"
+        )
+        assert tv[0] == "$10"
+        assert tv[1] == "$40"
+        assert tv[2] == "$65"
+        assert tv[3] == "50% up to $150"
