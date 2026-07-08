@@ -397,6 +397,39 @@ class TestThreeColumnRxContinuation:
         assert tv[1] == "$40"
         assert len(tv) == 2      # $50 and $99 both discarded
 
+    def test_florida_blue_subrow_mode(self):
+        """Florida Blue pattern: tiers with program sub-rows (Preventive /
+        Condition Care Rx / All Other X).  Preventive is skipped; the other
+        sub-row costs are appended to the tier, sub-labels dropped."""
+        tv = _extract_tier_values(
+            "Generic: Preventive: No Charge / Condition Care Rx: $4 / "
+            "All Other Generic: $20 / "
+            "Preferred Brand: Condition Care Rx: $50 / "
+            "All Other Preferred Brand: Deductible + $100 / "
+            "Non-preferred Brand: Deductible + $300 / "
+            "Specialty Drugs: Deductible + $500"
+        )
+        assert tv[0] == "$4 / $20"
+        assert tv[1] == "$50 / Deductible + $100"
+        assert tv[2] == "Deductible + $300"
+        assert tv[3] == "Deductible + $500"
+
+    def test_tier_number_with_unrecognized_descriptor_falls_back_to_number(self):
+        """'Tier 3 (Non-preferred)' — descriptor alone maps nothing, so the
+        leading tier number decides the slot."""
+        assert _label_to_tier_index("Tier 3 (Non-preferred)") == 2
+        assert _label_to_tier_index("Tier 4 (Non-preferred)") == 3
+
+    def test_all_other_prefix_stripped(self):
+        assert _label_to_tier_index("All Other Generic") == 0
+        assert _label_to_tier_index("All Other Preferred Brand") == 1
+
+    def test_preventive_only_tier_dropped(self):
+        """A tier whose only sub-row is Preventive ends up absent, not empty."""
+        tv = _extract_tier_values("Generic: Preventive: No Charge / Brand: $40")
+        assert 0 not in tv
+        assert tv[1] == "$40"
+
     def test_no_continuation_in_normal_two_column_table(self):
         """Standard 2-column table: each tier has exactly one cost — no trailing
         unlabeled parts, so continuation logic is inert."""

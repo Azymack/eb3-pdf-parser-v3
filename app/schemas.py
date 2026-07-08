@@ -43,6 +43,7 @@ class ExtractionResponse(BaseModel):
     pages_used: list[int]
     processing_time_seconds: float
     stage_timings: StageTimings
+    ocr_mode: str  # "auto" or "force" — reflects what was actually sent to docling
 
 
 class LlmTestResponse(BaseModel):

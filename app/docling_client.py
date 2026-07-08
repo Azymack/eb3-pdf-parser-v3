@@ -1,6 +1,8 @@
+import io
 import logging
 
 import httpx
+from pypdf import PdfReader
 
 from .config import get_settings
 
@@ -9,9 +11,52 @@ logger = logging.getLogger(__name__)
 # Conservative timeouts: connect fast, allow plenty of time for large PDFs to process.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
 
+# PDFs with fewer than this many average extractable characters per page are
+# classified as image-based (scanned) and sent to docling with ocr_mode=force.
+_IMAGE_BASED_CHARS_PER_PAGE_THRESHOLD = 100
+
+
+def is_image_based_pdf(pdf_bytes: bytes) -> bool:
+    """Return True if the PDF appears to be image-based (scanned, no text layer).
+
+    Uses pypdf to attempt text extraction locally.  If the average extractable
+    text across all pages is below the threshold the PDF is considered image-based
+    and requires forced OCR for accurate content extraction.
+
+    Failure to read the PDF is treated as text-based (safe default: don't
+    force OCR unnecessarily).
+    """
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if not reader.pages:
+            return True  # empty / unreadable — let docling decide
+
+        total_chars = sum(
+            len((page.extract_text() or "").strip())
+            for page in reader.pages
+        )
+        avg_chars_per_page = total_chars / len(reader.pages)
+        result = avg_chars_per_page < _IMAGE_BASED_CHARS_PER_PAGE_THRESHOLD
+        logger.debug(
+            "is_image_based_pdf: classification=%s avg_chars_per_page=%.1f",
+            "image-based" if result else "text-based",
+            avg_chars_per_page,
+        )
+        return result
+    except Exception:
+        logger.warning(
+            "is_image_based_pdf: failed to inspect PDF text content; "
+            "defaulting to text-based (will use configured ocr_mode)",
+            exc_info=True,
+        )
+        return False
+
 
 async def convert_pdf(pdf_bytes: bytes, filename: str) -> dict:
     """POST the PDF to docling-service and return the parsed ConvertResponse dict.
+
+    Automatically uses ocr_mode=force for image-based (scanned) PDFs, falling
+    back to the configured DOCLING_OCR_MODE for text-based PDFs.
 
     Raises distinct exceptions so the caller can surface precise 502 error details:
       - httpx.ConnectError   → docling-service is not reachable
@@ -21,12 +66,19 @@ async def convert_pdf(pdf_bytes: bytes, filename: str) -> dict:
     settings = get_settings()
     endpoint = f"{settings.DOCLING_SERVICE_URL}{settings.DOCLING_ENDPOINT}"
 
+    # Override ocr_mode to "force" for image-based PDFs so docling performs full OCR.
+    if is_image_based_pdf(pdf_bytes):
+        ocr_mode = "force"
+        logger.info("docling_client: image-based PDF detected — overriding ocr_mode to 'force'")
+    else:
+        ocr_mode = settings.DOCLING_OCR_MODE
+
     logger.info(
         "docling_client: sending conversion request",
         extra={
             "endpoint": endpoint,
             "filename": filename,
-            "ocr_mode": settings.DOCLING_OCR_MODE,
+            "ocr_mode": ocr_mode,
             "table_mode": settings.DOCLING_TABLE_MODE,
         },
     )
@@ -37,7 +89,7 @@ async def convert_pdf(pdf_bytes: bytes, filename: str) -> dict:
                 endpoint,
                 files={"file": (filename, pdf_bytes, "application/pdf")},
                 data={
-                    "ocr_mode": settings.DOCLING_OCR_MODE,
+                    "ocr_mode": ocr_mode,
                     "table_mode": settings.DOCLING_TABLE_MODE,
                 },
             )
@@ -59,6 +111,8 @@ async def convert_pdf(pdf_bytes: bytes, filename: str) -> dict:
 
     logger.info(
         "docling_client: conversion complete",
-        extra={"page_count": data.get("page_count"), "ocr_mode_used": data.get("ocr_mode_used")},
+        extra={"page_count": data.get("page_count"), "ocr_mode_used": ocr_mode},
     )
+    # Inject the ocr_mode we actually used so the pipeline can surface it in the response.
+    data["_ocr_mode_used"] = ocr_mode
     return data

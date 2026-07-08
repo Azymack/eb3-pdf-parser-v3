@@ -106,11 +106,20 @@ def _label_to_tier_index(label: str) -> int | None:
     n = re.sub(r'\s+', ' ', label.lower().strip())
     # Strip "drugs" suffix ("Generic Drugs" → "Generic")
     n = re.sub(r'\s+drugs?$', '', n).strip()
+    # Strip "all other" prefix ("All Other Generic" → "Generic") — sub-row qualifier
+    n = re.sub(r'^all\s+other\s+', '', n).strip()
     # Strip bare parenthetical tier numbers "(tier N)" — they carry no semantic info
     # beyond what the label text already says, e.g. "Tier 1 (Generic)" → "tier 1 generic"
     # Leave "(preferred)" / "(non-preferred)" etc. since they carry meaning.
     n = re.sub(r'\s*\(tier\s*\d+\)\s*', ' ', n).strip()
     n = re.sub(r'\s{2,}', ' ', n)
+
+    # ── Exclude preventive sub-tier labels → skip ────────────────────────────
+    # "Preventive" drugs are a special $0 sub-category within a tier (e.g.,
+    # "Generic (Preventive): No Charge" alongside "Generic: $20"). The standard
+    # tier cost is what we want; skipping preventive labels lets the next entry win.
+    if re.search(r'\bpreventive\b', n):
+        return None
 
     # ── Priority 1: Non-Preferred Brand → ALWAYS Tier 3 ──────────────────────
     # Catches: "Non-Preferred Brand", "Non-Preferred Brand Drugs",
@@ -183,6 +192,13 @@ def _label_to_tier_index(label: str) -> int | None:
     ):
         return 2
 
+    # ── Fallback: leading tier number with an unrecognized descriptor ─────────
+    # Catches labels like "Tier 3 (Non-preferred)" where the descriptor alone
+    # matched nothing above. The document's own tier number decides the slot.
+    m = re.match(r'^tier\s*([1-5])\b', n)
+    if m:
+        return int(m.group(1)) - 1
+
     return None  # unrecognized
 
 
@@ -211,6 +227,25 @@ def _strip_tier_labels(value: str) -> str:
     return " / ".join(parts)
 
 
+def _split_sublabel(value: str) -> tuple[str | None, str]:
+    """If value starts with an alpha sub-label ('SubLabel: cost'), return
+    (sublabel, cost); otherwise (None, value).  Sub-labels containing '$' or
+    '%' are treated as part of the cost, not a label."""
+    if ": " in value and value and value[0].isalpha():
+        sub, _, cost = value.partition(": ")
+        if "$" not in sub and "%" not in sub:
+            return sub.strip(), cost.strip()
+    return None, value
+
+
+def _is_preventive(label: str) -> bool:
+    return bool(re.search(r'\bpreventive\b', label.lower()))
+
+
+def _join_tier_value(current: str, addition: str) -> str:
+    return addition if not current else current + " / " + addition
+
+
 def _extract_tier_values(consolidated: str) -> dict[int, str]:
     """Parse a consolidated RX string into {tier_index: cost_value}.
 
@@ -224,6 +259,19 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
     where a tier's Preferred Network and In-Network retail costs appear in
     consecutive ' / '-separated segments with no second label:
       'Tier 2 (Brand): $80 / $90'  ->  tier index 1 value = '$80 / $90'
+
+    SUB-ROW MODE: when a mapped tier's own value contains a nested sub-label
+    ('Generic: Preventive: No Charge' or 'Preferred Brand: Condition Care Rx: $50'),
+    the tier has program sub-rows.  While sub-row mode is active for a tier:
+      - unrecognized labels ('Condition Care Rx: $4') append their COST to the tier
+      - duplicate mappings to the same tier ('All Other Generic: $20') append too
+      - 'Preventive' sub-rows are skipped (the $0 preventive-mandate sub-tier)
+    Plain tiers (no nested sub-label) keep strict first-match-wins semantics and
+    unrecognized labels reset continuation, as before.
+
+    Example — Florida Blue:
+      'Generic: Preventive: No Charge / Condition Care Rx: $4 / All Other Generic: $20'
+      → {0: '$4 / $20'}
     """
     if not consolidated:
         return {}
@@ -231,6 +279,7 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
     normalized = _TIER_SEMICOLON.sub(" / ", consolidated)
     result: dict[int, str] = {}
     last_mapped_idx: int | None = None  # most recent successfully mapped tier index
+    subrow_mode = False                 # last mapped tier has program sub-rows
 
     for part in normalized.split(" / "):
         part = part.strip()
@@ -238,7 +287,6 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
             continue
 
         if ": " in part and part[0].isalpha():
-            # Part has a potential tier label (alpha prefix before ": ")
             label, _, value = part.partition(": ")
             label = label.strip()
             value = value.strip()
@@ -246,21 +294,38 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
                 continue
             tier_idx = _label_to_tier_index(label)
             if tier_idx is not None:
+                sub, cost = _split_sublabel(value)
+                nested = sub is not None
                 if tier_idx not in result:
-                    result[tier_idx] = value
+                    if nested and _is_preventive(sub):
+                        result[tier_idx] = ""   # anchored; awaiting non-preventive sub-rows
+                    else:
+                        result[tier_idx] = cost if nested else value
                     last_mapped_idx = tier_idx
+                    subrow_mode = nested
+                elif subrow_mode and last_mapped_idx == tier_idx:
+                    # Sub-row re-using the tier label (e.g. 'All Other Generic: $20')
+                    if not (nested and _is_preventive(sub)):
+                        result[tier_idx] = _join_tier_value(result[tier_idx], cost)
                 else:
-                    # Duplicate label — first match wins; stop continuation tracking
+                    # Duplicate label outside sub-row mode — first match wins
                     last_mapped_idx = None
+                    subrow_mode = False
             else:
-                # Unrecognized label — stop continuation tracking
-                last_mapped_idx = None
+                # Unrecognized label
+                if subrow_mode and last_mapped_idx is not None:
+                    # Program sub-row (e.g. 'Condition Care Rx: $4') — append cost
+                    if not _is_preventive(label):
+                        result[last_mapped_idx] = _join_tier_value(result[last_mapped_idx], value)
+                else:
+                    last_mapped_idx = None
         else:
             # Unlabeled part — append to the most recent mapped tier if any
             if last_mapped_idx is not None:
-                result[last_mapped_idx] = result[last_mapped_idx] + " / " + part
+                result[last_mapped_idx] = _join_tier_value(result[last_mapped_idx], part)
 
-    return result
+    # Drop tiers that ended up empty (e.g. only a Preventive sub-row was present)
+    return {idx: v for idx, v in result.items() if v}
 
 
 def _extract_retail_only(value: str) -> str:
@@ -320,6 +385,8 @@ def _strip_rx_suffix(value: str) -> str:
         s = re.sub(r'\s*\bcopay\b\s+per\s+prescription\b.*$', '', p, flags=re.IGNORECASE).strip()
         # "30% coinsurance up to $X per prescription[...]" → "30% coinsurance up to $X"
         s = re.sub(r'\s*\bper\s+prescription\b.*$', '', s, flags=re.IGNORECASE).strip()
+        # "Deductible + $300 Copay" → "Deductible + $300"  (bare trailing "copay")
+        s = re.sub(r'\s+\bcopay\b$', '', s, flags=re.IGNORECASE).strip()
         stripped.append(s or p)   # never return an empty part
     return " / ".join(stripped)
 
@@ -381,6 +448,9 @@ def apply_post_processing(
         for field in _OON_RX_FIELDS:
             if field in result:
                 result[field] = ""
+        # Also prevent Pass 2 from propagating "Not covered" to per-tier OON fields.
+        # HMO/EPO per-tier OON fields should be "" (not applicable), not "Not covered".
+        oon_rx_not_covered = False
 
     # Pass 2: compute per-tier fields using label-based mapping.
     # If Preferred Network RX is present (3-column plan), merge with In-Network RX.

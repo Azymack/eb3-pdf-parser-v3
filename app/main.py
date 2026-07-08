@@ -205,6 +205,7 @@ async def _run_pipeline(
     docling_seconds = time.monotonic() - t0
     logger.info(f"pipeline[1/4]: done in {docling_seconds:.2f}s")
 
+    ocr_mode_used = docling_result.get("_ocr_mode_used", settings.DOCLING_OCR_MODE)
     pages = docling_result.get("pages", [])
     if not pages:
         raise HTTPException(status_code=502, detail="docling-service returned no page content")
@@ -291,4 +292,5 @@ async def _run_pipeline(
         pages_used=selected_page_numbers,
         processing_time_seconds=round(total_seconds, 3),
         stage_timings=stage_timings,
+        ocr_mode=ocr_mode_used,
     )
