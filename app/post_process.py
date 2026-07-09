@@ -7,8 +7,19 @@ Pass 1 — Normalization (RX field cleanup):
   2. Out-of-Network RX fields → empty for HMO/EPO plans.
 
 Pass 2 — Computed fields (derived, never sent to VLM):
-  The per-tier RX fields are computed from the consolidated In-Network RX /
-  Out-of-Network RX strings using LABEL-BASED mapping (not positional).
+  Per-tier RX fields are computed from consolidated RX strings using label-based
+  tier mapping.  Each tier cell is channel-split (_extract_retail_only /
+  _extract_mail_from_tier_value) so retail and mail-order costs in the same
+  cell are routed to the correct output fields.
+
+  health (2-col / Preferred+INN): In-Network per-tier merges Preferred + INN
+  columns when costs differ ("pref / inn").
+
+  health_3tier (Designated+INN+OON): each network column feeds its own per-tier
+  fields — no cross-column merge.
+
+Pass 2b — Mail-order retail dedup (INN/OON only):
+  Drop retail-only coinsurance the VLM wrongly copied into mail-order fields.
 
 Pass 3 — Mail Order RX label stripping:
   Mail Order RX fields display 90-day costs as plain values only ("$20 / $80"),
@@ -37,6 +48,9 @@ import re
 _TIER_SEMICOLON = re.compile(r';\s+(?=[A-Za-z][^;:/]+:\s)')
 
 _COMPUTED_TIER_FIELDS: frozenset[str] = frozenset({
+    "Designated Network Generic RX", "Designated Network Brand RX",
+    "Designated Network Tier 3 RX", "Designated Network Tier 4 RX",
+    "Designated Network Tier 5 RX",
     "In-Network Generic RX", "Out-of-Network Generic RX",
     "In-Network Brand RX", "Out-of-Network Brand RX",
     "In-Network Tier 3 RX", "Out-of-Network Tier 3 RX",
@@ -246,44 +260,177 @@ def _join_tier_value(current: str, addition: str) -> str:
     return addition if not current else current + " / " + addition
 
 
+# Parenthetical channel markers — carriers use many synonyms.
+_MAIL_CHANNEL = re.compile(r'\(\s*(?:mail[\s-]*order|home\s+delivery)\s*\)', re.I)
+_RETAIL_CHANNEL = re.compile(r'\(\s*retail(?:\s+only)?\s*\)', re.I)
+
+
 def _split_retail_mail(value: str) -> tuple[str, str | None]:
-    """Split a tier value carrying explicit '(retail)' / '(mail order)' qualifiers.
+    """Split a tier value with explicit retail + mail/home-delivery qualifiers.
 
     Returns (retail_value, mail_value_or_None):
       "$5 / prescription (retail), $10 / prescription (mail order)" → ("$5", "$10")
-      "$15 (retail), $30 (mail order)"                              → ("$15", "$30")
+      "$15 (retail), $30 (home delivery)"                          → ("$15", "$30")
+      "$90 copay (retail only)"                                      → ("$90 copay", None)
       "10% coinsurance up to $250 / prescription"                   → (unchanged, None)
 
-    Only splits when BOTH qualifiers are present — a lone '(retail)' or an
-    unqualified value is returned as-is with no mail-order component.
+    Splits when BOTH retail and mail/home-delivery markers appear (comma- or
+    semicolon-separated).  Lone retail markers are left for _extract_retail_only.
     """
-    if not (re.search(r'\(mail order\)', value, re.I) and re.search(r'\(retail\)', value, re.I)):
+    if not value:
         return value, None
-    m_re = re.search(r'([^,]*?)\s*\(retail\)', value, re.I)
-    m_mo = re.search(r'([^,]*?)\s*\(mail order\)', value, re.I)
-    retail = (m_re.group(1) if m_re else "").strip(" ,")
+    if not (_RETAIL_CHANNEL.search(value) and _MAIL_CHANNEL.search(value)):
+        return value, None
+    # "X (retail) and Y (home delivery)" — handled by _extract_home_delivery
+    if re.search(r'\(\s*retail\s*\)\s+and\b', value, re.I):
+        return value, None
+    m_re = re.search(r'([^,;]*?)\s*\(\s*retail(?:\s+only)?\s*\)', value, re.I)
+    m_mo = re.search(r'([^,;]*?)\s*\(\s*(?:mail[\s-]*order|home\s+delivery)\s*\)', value, re.I)
+    retail = (m_re.group(1) if m_re else value).strip(" ,")
     mail = (m_mo.group(1) if m_mo else "").strip(" ,")
-    # Strip the "/ prescription" unit suffix that rides along with the qualifier
-    retail = re.sub(r'\s*/\s*prescription$', '', retail).strip()
-    mail = re.sub(r'\s*/\s*prescription$', '', mail).strip()
-    return retail, mail
+    retail = re.sub(r'\s*/\s*prescription$', '', retail, flags=re.I).strip()
+    mail = re.sub(r'\s*/\s*prescription$', '', mail, flags=re.I).strip()
+    return retail, mail or None
 
 
-def _extract_tier_values_with_mail(consolidated: str) -> tuple[dict[int, str], dict[int, str]]:
-    """Like _extract_tier_values but also returns explicit per-tier mail-order costs.
+def _extract_retail_only(value: str) -> str:
+    """Isolate the retail / 30-day cost from a per-tier cell value.
 
-    Returns (retail_by_tier, mail_by_tier).  mail_by_tier only contains entries
-    for tiers whose value carried an explicit '(mail order)' qualifier — it is
-    empty for documents without such markers.
+    Handles Anthem-style dual costs and lone channel qualifiers:
+      "$20 copay (retail) and $40 copay (home delivery)" → "$20 copay"
+      "30% coinsurance (retail and home delivery)"       → "30% coinsurance"
+      "$90 copay (retail only)"                          → "$90 copay"
+      "$5 / prescription (retail)"                       → "$5"
+      "$20 copay"                                        → "$20 copay"
     """
-    retail = _extract_tier_values(consolidated)
+    if not value:
+        return value
+    # Dual-cost: "X (retail) and Y (home delivery|mail order)" — keep X only
+    m = re.match(r'^(.*?)\s*\(\s*retail\s*\)\s+and\b.*', value, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Same rate for both channels
+    m = re.match(r'^(.*?)\s*\(retail and home delivery\)', value, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Lone qualifiers — strip marker, keep cost
+    cleaned = re.sub(r'\s*\(\s*retail\s+only\s*\)', '', value, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r'\s*/\s*prescription\s*\(\s*retail\s*\)\s*$', '', cleaned, flags=re.I).strip()
+    cleaned = re.sub(r'\s*\(\s*retail\s*\)\s*$', '', cleaned, flags=re.IGNORECASE).strip(" ,")
+    return cleaned
+
+
+def _extract_home_delivery(value: str) -> str:
+    """Extract mail-order / home-delivery cost from a per-tier cell value.
+
+      "$20 copay (retail) and $40 copay (home delivery)" → "$40 copay"
+      "$15 (retail), $30 (mail order)"                  → "$30"
+      "30% coinsurance (retail and home delivery)"       → "30% coinsurance"
+      "$20 copay (retail only)"                          → ""
+    """
+    if not value:
+        return ""
+    if re.search(r'\(\s*retail\s+only\s*\)', value, re.I):
+        return ""
+    m = re.search(
+        r'\(\s*retail\s*\)\s+and\s+(.*?)\s*\(\s*(?:home\s+delivery|mail[\s-]*order)\s*\)',
+        value, re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        return m.group(1).strip()
+    m = re.match(r'^(.*?)\s*\(retail and home delivery\)', value, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _split_unlabeled_retail_mail(value: str) -> tuple[str, str | None]:
+    """Split VLM output where retail and mail are adjacent with no channel markers.
+
+    Anthem designated-column pattern:
+      '$5 / $10'  → retail '$5', mail '$10'
+      '$50 / $125' → retail '$50', mail '$125'
+
+    Does NOT split cross-network retail merges like '$80 / $90' (Preferred+INN) —
+    call only for single-network columns where dual flat-dollar pairs mean channels.
+    """
+    parts = [p.strip() for p in value.split(" / ") if p.strip()]
+    if len(parts) != 2:
+        return value, None
+    a, b = parts
+    if "%" in a or "%" in b or "coinsurance" in a.lower() or "coinsurance" in b.lower():
+        return value, None
+    if re.match(r'^\$\d', a) and re.match(r'^\$\d', b):
+        return a, b
+    return value, None
+
+
+def _normalize_tier_retail_value(value: str, *, split_retail_mail_pairs: bool = False) -> str:
+    """Retail portion of a tier cell, channel markers removed and suffix stripped."""
+    if not value:
+        return value
+    retail, _ = _split_retail_mail(value)
+    retail = _extract_retail_only(retail)
+    if split_retail_mail_pairs:
+        r, m = _split_unlabeled_retail_mail(retail)
+        if m:
+            retail = r
+    return _strip_rx_suffix(retail)
+
+
+def _extract_mail_from_tier_value(value: str, *, split_retail_mail_pairs: bool = False) -> str:
+    """Mail-order portion of a tier cell, or empty string when none."""
+    if not value:
+        return ""
+    hd = _extract_home_delivery(value)
+    if hd:
+        return _strip_rx_suffix(hd)
+    _, mail = _split_retail_mail(value)
+    if mail:
+        return _strip_rx_suffix(mail)
+    if split_retail_mail_pairs:
+        _, mail = _split_unlabeled_retail_mail(value)
+        if mail:
+            return _strip_rx_suffix(mail)
+    return ""
+
+
+def _extract_tier_values_with_mail(
+    consolidated: str,
+    *,
+    split_retail_mail_pairs: bool = False,
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Parse consolidated RX into per-tier retail and mail-order dicts."""
+    raw = _extract_tier_values(consolidated)
+    retail: dict[int, str] = {}
     mail: dict[int, str] = {}
-    for idx, val in list(retail.items()):
-        r, m = _split_retail_mail(val)
-        retail[idx] = r
+    for idx, val in raw.items():
+        retail[idx] = _normalize_tier_retail_value(
+            val, split_retail_mail_pairs=split_retail_mail_pairs,
+        )
+        m = _extract_mail_from_tier_value(
+            val, split_retail_mail_pairs=split_retail_mail_pairs,
+        )
         if m:
             mail[idx] = m
     return retail, mail
+
+
+def _build_mail_order_from_consolidated(
+    consolidated: str,
+    *,
+    split_retail_mail_pairs: bool = False,
+) -> str:
+    """Join per-tier mail-order costs found in a consolidated RX string."""
+    raw = _extract_tier_values(consolidated)
+    parts: list[str] = []
+    for idx in sorted(raw):
+        m = _extract_mail_from_tier_value(
+            raw[idx], split_retail_mail_pairs=split_retail_mail_pairs,
+        )
+        if m:
+            parts.append(m)
+    return " / ".join(parts)
 
 
 def _extract_tier_values(consolidated: str) -> dict[int, str]:
@@ -383,42 +530,6 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
     return {idx: v for idx, v in result.items() if v}
 
 
-def _extract_retail_only(value: str) -> str:
-    """Strip home-delivery cost from a Preferred Network tier value.
-
-    Preferred Network column cells often encode both retail and home delivery
-    costs in a single string, e.g.:
-      "$20 copay (retail) and $40 copay (home delivery)" → "$20 copay"
-      "30% coinsurance (retail and home delivery)"       → "30% coinsurance"
-      "$20 copay"  (no qualifier)                        → "$20 copay"
-    """
-    # Pattern 1: "X (retail) and Y (home delivery)" — keep X only
-    m = re.match(r'^(.*?)\s*\(retail\)\s+and\b.*', value, re.IGNORECASE | re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    # Pattern 2: "X (retail and home delivery)" — strip the qualifier
-    cleaned = re.sub(r'\s*\(retail and home delivery\)', '', value, flags=re.IGNORECASE).strip()
-    return cleaned
-
-
-def _extract_home_delivery(value: str) -> str:
-    """Extract the home delivery (mail order) cost from a Preferred Network tier value.
-
-      "$20 copay (retail) and $40 copay (home delivery)" → "$40 copay"
-      "30% coinsurance (retail and home delivery)"       → "30% coinsurance" (same rate)
-      "$20 copay"  (no qualifier)                        → "" (no mail order info)
-    """
-    # Pattern 1: "X (retail) and Y (home delivery)" — keep Y
-    m = re.search(r'\(retail\)\s+and\s+(.*?)\s*\(home delivery\)', value, re.IGNORECASE | re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    # Pattern 2: "X (retail and home delivery)" — same cost applies to mail order
-    m = re.match(r'^(.*?)\s*\(retail and home delivery\)', value, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return ""
-
-
 def _strip_rx_suffix(value: str) -> str:
     """Strip per-prescription descriptor suffixes from RX cost values.
 
@@ -427,8 +538,10 @@ def _strip_rx_suffix(value: str) -> str:
 
     Examples:
       "$20 copay per prescription, deductible does not apply" → "$20"
+      "$5/prescription, deductible does not apply"            → "$5"
       "$80 copay per prescription after deductible is met"   → "$80"
       "30% coinsurance up to $400 per prescription..."       → "30% coinsurance up to $400"
+      "30% coinsurance up to $250/prescription"              → unchanged
       "$80 copay... / $90 copay..."                          → "$80 / $90"
     """
     if not value:
@@ -436,6 +549,11 @@ def _strip_rx_suffix(value: str) -> str:
     parts = [p.strip() for p in value.split(" / ")]
     stripped: list[str] = []
     for p in parts:
+        # "$X/prescription[, deductible...]" → "$X"  (flat-copay shorthand; not coinsurance)
+        m = re.match(r'^(\$\d+(?:\.\d+)?)/prescription\b.*$', p, flags=re.IGNORECASE)
+        if m:
+            stripped.append(m.group(1))
+            continue
         # "$X copay per prescription[,  ...]" → "$X"
         s = re.sub(r'\s*\bcopay\b\s+per\s+prescription\b.*$', '', p, flags=re.IGNORECASE).strip()
         # "30% coinsurance up to $X per prescription[...]" → "30% coinsurance up to $X"
@@ -464,9 +582,8 @@ def _merge_preferred_and_inn_tier_values(
     """
     pref_raw = _extract_tier_values(preferred_rx)
     inn_raw  = _extract_tier_values(inn_rx)
-    # Retail-only + strip verbosity for clean comparison and output
-    pref = {idx: _strip_rx_suffix(_extract_retail_only(v)) for idx, v in pref_raw.items()}
-    inn  = {idx: _strip_rx_suffix(v)                       for idx, v in inn_raw.items()}
+    pref = {idx: _normalize_tier_retail_value(v) for idx, v in pref_raw.items()}
+    inn  = {idx: _normalize_tier_retail_value(v) for idx, v in inn_raw.items()}
     result: dict[int, str] = {}
     for idx in sorted(set(pref) | set(inn)):
         p = pref.get(idx, "")
@@ -514,9 +631,20 @@ def apply_post_processing(
         oon_rx_not_covered = False
 
     # Pass 2: compute per-tier fields using label-based mapping.
-    # If Preferred Network RX is present (3-column plan), merge with In-Network RX.
+    # health (2-col): Preferred Network RX + In-Network RX merge into In-Network per-tier.
+    # health_3tier: Designated Network RX, In-Network RX, and Out-of-Network RX each
+    # feed their own per-tier fields — no cross-column merge.
     preferred_rx = result.get("Preferred Network RX") or ""
-    for net_prefix in ("In-Network", "Out-of-Network"):
+    designated_tier_fields = any(
+        f"Designated Network {suffix}" in output_field_names
+        for suffix in _TIER_SUFFIXES
+    )
+    net_prefixes: tuple[str, ...] = (
+        ("Designated Network", "In-Network", "Out-of-Network")
+        if designated_tier_fields
+        else ("In-Network", "Out-of-Network")
+    )
+    for net_prefix in net_prefixes:
         # Propagate "Not covered" to all per-tier OON fields when applicable.
         if net_prefix == "Out-of-Network" and oon_rx_not_covered:
             for suffix in _TIER_SUFFIXES:
@@ -526,26 +654,21 @@ def apply_post_processing(
             continue
 
         consolidated = result.get(f"{net_prefix} RX") or ""
-        if net_prefix == "In-Network" and preferred_rx:
+        split_pairs = designated_tier_fields and net_prefix == "Designated Network"
+        if (
+            net_prefix == "In-Network"
+            and preferred_rx
+            and not designated_tier_fields
+        ):
             tier_values = _merge_preferred_and_inn_tier_values(preferred_rx, consolidated)
         else:
-            tier_values, explicit_mail = _extract_tier_values_with_mail(consolidated)
-            # Explicit '(retail)/(mail order)' qualifiers in the document are
-            # authoritative: rebuild the Mail Order field from them, overriding
-            # the VLM's own attribution (it sometimes includes retail-only tiers).
-            if net_prefix == "In-Network" and explicit_mail:
-                mo_field = "In-Network Mail Order RX"
-                if mo_field in output_field_names:
-                    result[mo_field] = " / ".join(
-                        _strip_rx_suffix(explicit_mail[i]) for i in sorted(explicit_mail)
-                    )
+            tier_values, _explicit_mail = _extract_tier_values_with_mail(
+                consolidated, split_retail_mail_pairs=split_pairs,
+            )
         for i, suffix in enumerate(_TIER_SUFFIXES):
             field_name = f"{net_prefix} {suffix}"
             if field_name in output_field_names:
-                v = tier_values.get(i, "")
-                # Strip "copay per prescription..." verbosity from 2-column plan values
-                # (3-column values are already stripped inside _merge_preferred_and_inn_tier_values)
-                result[field_name] = _strip_rx_suffix(v) if v else v
+                result[field_name] = tier_values.get(i, "")
 
     # Pass 2b: drop retail coinsurance values the VLM copied into Mail Order.
     # A mail-order part that verbatim-equals a retail per-tier value AND is a
@@ -563,6 +686,10 @@ def apply_post_processing(
         for sfx in _TIER_SUFFIXES
     } - {""}
     for mo_field in _MAIL_ORDER_RX_FIELDS:
+        # Designated mail order often legitimately repeats retail coinsurance rates
+        # for specialty tiers — skip the retail-dedup heuristic for that column.
+        if mo_field == "Designated Network Mail Order RX":
+            continue
         val = result.get(mo_field)
         if isinstance(val, str) and val and retail_tier_values:
             kept = [
@@ -581,21 +708,36 @@ def apply_post_processing(
         if isinstance(val, str) and val:
             result[field] = _strip_tier_labels(val)
 
-    # Pass 4: For 3-column plans, derive Mail Order deterministically from the
-    # home-delivery costs embedded in the Preferred Network column.  This overrides
-    # whatever Pass 3 produced for In-Network Mail Order RX and is more reliable
-    # than VLM extraction (which sometimes picks the wrong column for Tier 4).
-    if preferred_rx:
-        pref_raw = _extract_tier_values(preferred_rx)
-        hd_parts: list[str] = []
-        for idx in sorted(pref_raw):
-            hd = _extract_home_delivery(pref_raw[idx])
-            if hd:
-                hd_parts.append(_strip_rx_suffix(hd))
-        if hd_parts and "In-Network Mail Order RX" in output_field_names:
-            result["In-Network Mail Order RX"] = " / ".join(hd_parts)
-        # Propagate "Not covered" to OON Mail Order when the OON column is not covered.
-        if oon_rx_not_covered and "Out-of-Network Mail Order RX" in output_field_names:
-            result["Out-of-Network Mail Order RX"] = "Not covered"
+    # Pass 4: Derive mail order from channel markers in each network's RX column.
+    mail_sources: list[tuple[str, str, str, bool]] = []
+    for net_prefix in net_prefixes:
+        rx = result.get(f"{net_prefix} RX") or ""
+        mo_field = f"{net_prefix} Mail Order RX"
+        if mo_field in output_field_names:
+            split_pairs = designated_tier_fields and net_prefix == "Designated Network"
+            mail_sources.append((net_prefix, rx, mo_field, split_pairs))
+    if (
+        preferred_rx
+        and not designated_tier_fields
+        and "In-Network Mail Order RX" in output_field_names
+    ):
+        mail_sources = [
+            ("In-Network", preferred_rx, "In-Network Mail Order RX", False),
+            *[
+                (np, rx, mo, sp)
+                for np, rx, mo, sp in mail_sources
+                if mo != "In-Network Mail Order RX"
+            ],
+        ]
+    for net_prefix, consolidated, mo_field, split_pairs in mail_sources:
+        derived = _build_mail_order_from_consolidated(
+            consolidated, split_retail_mail_pairs=split_pairs,
+        )
+        if derived:
+            result[mo_field] = derived
+        elif designated_tier_fields and net_prefix != "Designated Network":
+            # health_3tier INN/OON columns with no embedded mail → no mail benefit.
+            # Clears VLM mail wrongly copied from the Designated column.
+            result[mo_field] = ""
 
     return result

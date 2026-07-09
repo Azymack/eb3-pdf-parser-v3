@@ -1,10 +1,16 @@
 """Tests for post_process.py."""
 from app.post_process import (
     COMPUTED_FIELD_NAMES,
+    _build_mail_order_from_consolidated,
+    _extract_home_delivery,
+    _extract_mail_from_tier_value,
+    _extract_retail_only,
     _extract_tier_values,
     _extract_tier_values_with_mail,
     _label_to_tier_index,
+    _normalize_tier_retail_value,
     _split_retail_mail,
+    _split_unlabeled_retail_mail,
     _strip_tier_labels,
     apply_post_processing,
     vlm_field_names,
@@ -12,6 +18,9 @@ from app.post_process import (
 from app.schemas import CATEGORY_FIELDS
 
 _COMPUTED_TIER_FIELDS = {
+    "Designated Network Generic RX", "Designated Network Brand RX",
+    "Designated Network Tier 3 RX", "Designated Network Tier 4 RX",
+    "Designated Network Tier 5 RX",
     "In-Network Generic RX", "Out-of-Network Generic RX",
     "In-Network Brand RX", "Out-of-Network Brand RX",
     "In-Network Tier 3 RX", "Out-of-Network Tier 3 RX",
@@ -109,7 +118,7 @@ def test_health_has_consolidated_and_tier_rx_fields():
         assert f in health_fields, f"health schema missing: {f!r}"
     # Mail-order tier variants must NOT exist (never added back)
     for old in ("In-Network Generic Mail Order RX", "In-Network Brand Mail Order RX",
-                "In-Network Tier 3 Mail Order RX", "Designated Network Generic RX"):
+                "In-Network Tier 3 Mail Order RX"):
         assert old not in health_fields, f"Old field present: {old!r}"
 
 
@@ -119,9 +128,12 @@ def test_health_3tier_has_new_rx_fields():
     assert "In-Network RX" in fields
     assert "Out-of-Network RX" in fields
     assert "Designated Network Mail Order RX" in fields
-    # Designated Network tier fields must NOT exist (not added)
-    for old in ("Designated Network Generic RX", "Designated Network Brand RX",
-                "Designated Network Tier 3 RX", "Designated Network Generic Mail Order RX"):
+    # Designated per-tier fields are computed from Designated Network RX
+    for tier in ("Generic RX", "Brand RX", "Tier 3 RX", "Tier 4 RX", "Tier 5 RX"):
+        assert f"Designated Network {tier}" in fields
+    # Mail-order tier variants must NOT exist (never added back)
+    for old in ("Designated Network Generic Mail Order RX",
+                "In-Network Generic Mail Order RX"):
         assert old not in fields, f"Old field present: {old!r}"
 
 
@@ -149,8 +161,13 @@ class TestSplitRetailMail:
         assert r == "10% coinsurance up to $250 / prescription"
         assert m is None
 
-    def test_retail_only_qualifier_unchanged(self):
-        """A lone '(retail)' without a mail-order counterpart is not split."""
+    def test_home_delivery_synonym(self):
+        r, m = _split_retail_mail("$15 (retail), $30 (home delivery)")
+        assert r == "$15"
+        assert m == "$30"
+
+    def test_retail_only_qualifier_stripped_by_normalize(self):
+        assert _extract_retail_only("$20 copay (retail only)") == "$20 copay"
         r, m = _split_retail_mail("$20 copay (retail)")
         assert r == "$20 copay (retail)"
         assert m is None
@@ -423,6 +440,153 @@ class TestMailOrderStrippedByPostProcessing:
         }
         result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
         assert result["In-Network Mail Order RX"] == "$25 / $80"
+
+
+class TestChannelSplitting:
+    """Unified retail / mail-order channel splitting for all network columns."""
+
+    def test_anthem_retail_and_home_delivery(self):
+        cell = "$5 copay (retail) and $10 copay (home delivery)"
+        assert _normalize_tier_retail_value(cell) == "$5"
+        assert _extract_mail_from_tier_value(cell) == "$10"
+        assert _build_mail_order_from_consolidated(
+            f"Generic: {cell} / Brand: $50 copay (retail) and $125 copay (home delivery)"
+        ) == "$10 / $125"
+
+    def test_retail_and_home_delivery_same_rate(self):
+        cell = "30% coinsurance (retail and home delivery)"
+        assert _normalize_tier_retail_value(cell) == "30% coinsurance"
+        assert _extract_mail_from_tier_value(cell) == "30% coinsurance"
+
+    def test_newline_retail_only_cleaned_in_per_tier(self):
+        s = ("Generic (Tier 1): $5 / prescription (retail)\n"
+             "Preferred Brand (Tier 2): $15 / prescription (retail)\n"
+             "Specialty Drugs (Tier 4): 10% coinsurance up to $250 / prescription")
+        retail, mail = _extract_tier_values_with_mail(s)
+        assert retail[0] == "$5"
+        assert retail[1] == "$15"
+        assert mail == {}
+
+    def test_unlabeled_retail_mail_pair_on_designated(self):
+        assert _split_unlabeled_retail_mail("$5 / $10") == ("$5", "$10")
+        assert _split_unlabeled_retail_mail("$50 / $125") == ("$50", "$125")
+        # Cross-network retail merge must NOT be split as retail/mail
+        assert _normalize_tier_retail_value("$80 / $90") == "$80 / $90"
+        assert _normalize_tier_retail_value("$5 / $10", split_retail_mail_pairs=True) == "$5"
+
+    def test_vlm_unlabeled_pairs_live_output_pattern(self):
+        """Regression: VLM puts retail/mail as '$5 / $10' in Designated Network RX."""
+        fields = {
+            "Network Type": "HMO",
+            "Designated Network RX": (
+                "Generic: $5 / $10 / Brand: $20 / $50 / "
+                "Tier 3: $50 / $125 / "
+                "Tier 4: 30% coinsurance up to $250/prescription"
+            ),
+            "In-Network RX": (
+                "Generic: $15/prescription, deductible does not apply / "
+                "Brand: $30/prescription, deductible does not apply / "
+                "Tier 3: $60/prescription, deductible does not apply / "
+                "Tier 4: 40% coinsurance up to $250/prescription"
+            ),
+            "Out-of-Network RX": "",
+            # VLM wrongly copies designated mail into In-Network mail order
+            "In-Network Mail Order RX": "$10 / $50 / $125",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health_3tier"])
+        assert result["Designated Network Generic RX"] == "$5"
+        assert result["Designated Network Brand RX"] == "$20"
+        assert result["Designated Network Tier 3 RX"] == "$50"
+        assert result["Designated Network Tier 4 RX"] == (
+            "30% coinsurance up to $250/prescription"
+        )
+        assert result["In-Network Generic RX"] == "$15"
+        assert result["Designated Network Mail Order RX"] == "$10 / $50 / $125"
+        assert result["In-Network Mail Order RX"] == ""
+
+    def test_designated_column_derives_mail_order_pass4(self):
+        fields = {
+            "Network Type": "HMO",
+            "Designated Network RX": (
+                "Generic: $5 copay (retail) and $10 copay (home delivery) / "
+                "Brand: $50 copay (retail) and $125 copay (home delivery) / "
+                "Tier 3: $50 copay (retail) and $125 copay (home delivery) / "
+                "Tier 4: 30% coinsurance (retail and home delivery)"
+            ),
+            "In-Network RX": (
+                "Generic: $15/prescription, deductible does not apply / "
+                "Brand: $30/prescription, deductible does not apply"
+            ),
+            "Out-of-Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health_3tier"])
+        assert result["Designated Network Generic RX"] == "$5"
+        assert result["Designated Network Mail Order RX"] == (
+            "$10 / $125 / $125 / 30% coinsurance"
+        )
+        assert result["In-Network Generic RX"] == "$15"
+
+
+class TestHealth3TierDesignatedTierFields:
+    """health_3tier: each network column feeds its own per-tier fields with stripped costs."""
+
+    def test_anthem_platinum_select_hmo_pattern(self):
+        """Regression for 1768608307 — Designated vs In-Network columns differ per tier."""
+        fields = {
+            "Network Type": "HMO",
+            "Designated Network RX": (
+                "Generic: $5/prescription, deductible does not apply / "
+                "Brand: $50/prescription, deductible does not apply / "
+                "Tier 3: $50/prescription, deductible does not apply / "
+                "Tier 4: 30% coinsurance up to $250/prescription"
+            ),
+            "In-Network RX": (
+                "Generic: $15/prescription, deductible does not apply / "
+                "Brand: $30/prescription, deductible does not apply / "
+                "Tier 3: $60/prescription, deductible does not apply / "
+                "Tier 4: 40% coinsurance up to $250/prescription"
+            ),
+            "Out-of-Network RX": "",
+            "Designated Network Mail Order RX": (
+                "$10 / $50 / $125 / 30% coinsurance up to $250/prescription"
+            ),
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health_3tier"])
+        assert result["Designated Network Generic RX"] == "$5"
+        assert result["In-Network Generic RX"] == "$15"
+        assert result["Designated Network Brand RX"] == "$50"
+        assert result["In-Network Brand RX"] == "$30"
+        assert result["Designated Network Tier 3 RX"] == "$50"
+        assert result["In-Network Tier 3 RX"] == "$60"
+        assert result["Designated Network Tier 4 RX"] == "30% coinsurance up to $250/prescription"
+        assert result["In-Network Tier 4 RX"] == "40% coinsurance up to $250/prescription"
+        assert result["Designated Network Mail Order RX"] == (
+            "$10 / $50 / $125 / 30% coinsurance up to $250/prescription"
+        )
+        assert result["Out-of-Network Generic RX"] == ""
+
+    def test_designated_does_not_merge_into_inn_per_tier(self):
+        """When designated per-tier fields exist, In-Network per-tier uses In-Network RX only."""
+        fields = {
+            "Network Type": "PPO",
+            "Preferred Network RX": "Generic: $10 / Brand: $40",
+            "Designated Network RX": "Generic: $5 / Brand: $50",
+            "In-Network RX": "Generic: $15 / Brand: $30",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health_3tier"])
+        assert result["Designated Network Generic RX"] == "$5"
+        assert result["In-Network Generic RX"] == "$15"   # not "$5 / $15"
+        assert result["Designated Network Brand RX"] == "$50"
+        assert result["In-Network Brand RX"] == "$30"
+
+
+class TestStripRxSuffix:
+    def test_flat_copay_per_prescription_shorthand(self):
+        from app.post_process import _strip_rx_suffix
+        assert _strip_rx_suffix("$5/prescription, deductible does not apply") == "$5"
+        assert _strip_rx_suffix("30% coinsurance up to $250/prescription") == (
+            "30% coinsurance up to $250/prescription"
+        )
 
 
 class TestThreeColumnRxContinuation:

@@ -29,9 +29,6 @@ live = pytest.mark.skipif(not LIVE, reason="set RUN_LIVE_RX_TESTS=1 to run live 
 # In-Network/Out-of-Network tier fields (Generic, Brand, Tier 3-5) are now
 # computed fields that intentionally DO appear — they are NOT in this set.
 OLD_FIELDS = {
-    "Designated Network Generic RX", "Designated Network Brand RX",
-    "Designated Network Tier 3 RX", "Designated Network Tier 4 RX",
-    "Designated Network Tier 5 RX",
     "In-Network Generic Mail Order RX", "Out-of-Network Generic Mail Order RX",
     "In-Network Brand Mail Order RX", "Out-of-Network Brand Mail Order RX",
     "In-Network Tier 3 Mail Order RX", "Out-of-Network Tier 3 Mail Order RX",
