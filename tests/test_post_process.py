@@ -386,6 +386,40 @@ class TestApplyPostProcessingLabelBased:
         assert result["In-Network Tier 5 RX"] == "$190 / $275 / $325"
         assert result["Out-of-Network Tier 5 RX"] == "Not covered"
 
+    def test_embedded_specialty_drugs_in_tier_cells_routes_to_tier5(self):
+        """UHC SBC: Specialty Drugs cost parenthetical inside each tier cell."""
+        fields = {
+            "Network Type": "HMO",
+            "In-Network RX": (
+                "Tier 1 (Generic): $10 / "
+                "Tier 2 (Midrange-Cost): $40 (Specialty Drugs: $40 copay) / "
+                "Tier 3 (Midrange-Cost): $75 (Specialty Drugs: $100 copay) / "
+                "Tier 4 (Additional High-Cost): $125 (Specialty Drugs: $150 copay)"
+            ),
+            "Out-of-Network RX": "",
+            "Preferred Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "$10"
+        assert result["In-Network Brand RX"] == "$40"
+        assert result["In-Network Tier 3 RX"] == "$75"
+        assert result["In-Network Tier 4 RX"] == "$125"
+        assert result["In-Network Tier 5 RX"] == "$40 / $100 / $150"
+
+    def test_uhc_specialty_drugs_aggregate_row(self):
+        """UHC SBC: separate Specialty Drugs aggregate row after Tier 4."""
+        fields = {
+            "Network Type": "EPO",
+            "In-Network RX": (
+                "Tier 1: $10 / Tier 2: $35 / Tier 3: $75 / Tier 4: $250 / "
+                "Specialty Drugs: $10 / $150 / $350 / $500"
+            ),
+            "Out-of-Network RX": "",
+            "Preferred Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Tier 5 RX"] == "$10 / $150 / $350 / $500"
+
     def test_non_preferred_brand_routes_to_tier3_not_brand(self):
         fields = {
             "Network Type": "PPO",

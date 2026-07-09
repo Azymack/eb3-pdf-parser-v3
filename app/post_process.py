@@ -32,6 +32,7 @@ Pass 3 — Mail Order RX label stripping:
     Generic (non-preferred) suffix form → Generic RX (merged)
     Non-Preferred Specialty → Tier 5 RX
     Specialty Drugs row (standalone, below Tier 4) → Tier 5 RX (joined sub-rows)
+    Specialty Drugs embedded in tier cells → Tier 5 RX (joined, retail cells cleaned)
     Specialty / Preferred Specialty → Tier 4 RX
     Generic / Preferred Generic → Generic RX (Tier 1)
     Brand / Preferred Brand → Brand RX (Tier 2)
@@ -362,6 +363,89 @@ def _merge_split_tier_value(current: str, addition: str) -> str:
     return current + " / " + addition
 
 
+# Parenthetical specialty costs inside a tier cell, e.g. "(Specialty Drugs: $150 copay)".
+_PAREN_SPECIALTY_DRUGS = re.compile(
+    r'\(\s*Specialty\s+Drugs?\s*\*?\s*:?\s*([^)]+?)\s*\)',
+    re.IGNORECASE,
+)
+
+
+def _normalize_specialty_cost_fragment(value: str) -> str:
+    if not value:
+        return ""
+    return _strip_rx_suffix(_normalize_tier_retail_value(value))
+
+
+def _strip_embedded_specialty_from_value(value: str) -> str:
+    """Remove inline (Specialty Drugs: $X) fragments from a retail tier value."""
+    if not value:
+        return value
+    parts: list[str] = []
+    for part in value.split(" / "):
+        cleaned = _PAREN_SPECIALTY_DRUGS.sub("", part).strip(" ,")
+        if cleaned:
+            parts.append(cleaned)
+    return " / ".join(parts)
+
+
+def _apply_embedded_specialty_tier5(tier_values: dict[int, str]) -> dict[int, str]:
+    """Move (Specialty Drugs: $X) fragments from tier 1-4 cells into Tier 5 RX."""
+    if not tier_values:
+        return tier_values
+
+    result = dict(tier_values)
+    if result.get(4, "").strip():
+        for idx in list(result):
+            if idx <= 3:
+                result[idx] = _strip_embedded_specialty_from_value(result[idx])
+        return result
+
+    specialty_parts: list[str] = []
+    for idx in sorted(k for k in result if k <= 3):
+        val = result[idx]
+        for part in val.split(" / "):
+            for match in _PAREN_SPECIALTY_DRUGS.finditer(part):
+                specialty_parts.append(match.group(1).strip())
+        result[idx] = _strip_embedded_specialty_from_value(val)
+
+    if specialty_parts:
+        result[4] = " / ".join(specialty_parts)
+    return result
+
+
+def _finalize_tier_value_dict(
+    raw_tiers: dict[int, str],
+    *,
+    split_retail_mail_pairs: bool = False,
+) -> dict[int, str]:
+    """Normalize parsed tier values, including Tier 5 specialty aggregates."""
+    result: dict[int, str] = {}
+    for idx, val in raw_tiers.items():
+        if idx <= 3:
+            result[idx] = _normalize_tier_retail_value(
+                val, split_retail_mail_pairs=split_retail_mail_pairs,
+            )
+        else:
+            parts = [
+                _normalize_specialty_cost_fragment(part)
+                for part in val.split(" / ")
+                if part.strip()
+            ]
+            result[idx] = " / ".join(part for part in parts if part)
+    return result
+
+
+def _parse_retail_tier_values(
+    consolidated: str,
+    *,
+    split_retail_mail_pairs: bool = False,
+) -> dict[int, str]:
+    raw = _apply_embedded_specialty_tier5(_extract_tier_values(consolidated))
+    return _finalize_tier_value_dict(
+        raw, split_retail_mail_pairs=split_retail_mail_pairs,
+    )
+
+
 # Parenthetical channel markers — carriers use many synonyms.
 _MAIL_CHANNEL = re.compile(r'\(\s*(?:mail[\s-]*order|home\s+delivery)\s*\)', re.I)
 _RETAIL_CHANNEL = re.compile(r'\(\s*retail(?:\s+only)?\s*\)', re.I)
@@ -504,12 +588,12 @@ def _extract_tier_values_with_mail(
 ) -> tuple[dict[int, str], dict[int, str]]:
     """Parse consolidated RX into per-tier retail and mail-order dicts."""
     raw = _extract_tier_values(consolidated)
-    retail: dict[int, str] = {}
+    retail = _finalize_tier_value_dict(
+        _apply_embedded_specialty_tier5(raw),
+        split_retail_mail_pairs=split_retail_mail_pairs,
+    )
     mail: dict[int, str] = {}
     for idx, val in raw.items():
-        retail[idx] = _normalize_tier_retail_value(
-            val, split_retail_mail_pairs=split_retail_mail_pairs,
-        )
         m = _extract_mail_from_tier_value(
             val, split_retail_mail_pairs=split_retail_mail_pairs,
         )
@@ -707,8 +791,8 @@ def _merge_preferred_and_inn_tier_values(
     """
     pref_raw = _extract_tier_values(preferred_rx)
     inn_raw  = _extract_tier_values(inn_rx)
-    pref = {idx: _normalize_tier_retail_value(v) for idx, v in pref_raw.items()}
-    inn  = {idx: _normalize_tier_retail_value(v) for idx, v in inn_raw.items()}
+    pref = _finalize_tier_value_dict(_apply_embedded_specialty_tier5(pref_raw))
+    inn  = _finalize_tier_value_dict(_apply_embedded_specialty_tier5(inn_raw))
     result: dict[int, str] = {}
     for idx in sorted(set(pref) | set(inn)):
         p = pref.get(idx, "")
