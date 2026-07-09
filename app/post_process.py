@@ -246,6 +246,46 @@ def _join_tier_value(current: str, addition: str) -> str:
     return addition if not current else current + " / " + addition
 
 
+def _split_retail_mail(value: str) -> tuple[str, str | None]:
+    """Split a tier value carrying explicit '(retail)' / '(mail order)' qualifiers.
+
+    Returns (retail_value, mail_value_or_None):
+      "$5 / prescription (retail), $10 / prescription (mail order)" → ("$5", "$10")
+      "$15 (retail), $30 (mail order)"                              → ("$15", "$30")
+      "10% coinsurance up to $250 / prescription"                   → (unchanged, None)
+
+    Only splits when BOTH qualifiers are present — a lone '(retail)' or an
+    unqualified value is returned as-is with no mail-order component.
+    """
+    if not (re.search(r'\(mail order\)', value, re.I) and re.search(r'\(retail\)', value, re.I)):
+        return value, None
+    m_re = re.search(r'([^,]*?)\s*\(retail\)', value, re.I)
+    m_mo = re.search(r'([^,]*?)\s*\(mail order\)', value, re.I)
+    retail = (m_re.group(1) if m_re else "").strip(" ,")
+    mail = (m_mo.group(1) if m_mo else "").strip(" ,")
+    # Strip the "/ prescription" unit suffix that rides along with the qualifier
+    retail = re.sub(r'\s*/\s*prescription$', '', retail).strip()
+    mail = re.sub(r'\s*/\s*prescription$', '', mail).strip()
+    return retail, mail
+
+
+def _extract_tier_values_with_mail(consolidated: str) -> tuple[dict[int, str], dict[int, str]]:
+    """Like _extract_tier_values but also returns explicit per-tier mail-order costs.
+
+    Returns (retail_by_tier, mail_by_tier).  mail_by_tier only contains entries
+    for tiers whose value carried an explicit '(mail order)' qualifier — it is
+    empty for documents without such markers.
+    """
+    retail = _extract_tier_values(consolidated)
+    mail: dict[int, str] = {}
+    for idx, val in list(retail.items()):
+        r, m = _split_retail_mail(val)
+        retail[idx] = r
+        if m:
+            mail[idx] = m
+    return retail, mail
+
+
 def _extract_tier_values(consolidated: str) -> dict[int, str]:
     """Parse a consolidated RX string into {tier_index: cost_value}.
 
@@ -275,6 +315,21 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
     """
     if not consolidated:
         return {}
+
+    # Newline-separated output: each line is one complete tier entry and its
+    # value is kept whole — ' / ' inside a line is part of the value (e.g.
+    # '10% coinsurance up to $250 / prescription'), NOT a tier separator.
+    if "\n" in consolidated:
+        result_nl: dict[int, str] = {}
+        for line in consolidated.splitlines():
+            line = line.strip()
+            if not line or ": " not in line or not line[0].isalpha():
+                continue
+            label, _, value = line.partition(": ")
+            tier_idx = _label_to_tier_index(label.strip())
+            if tier_idx is not None and tier_idx not in result_nl and value.strip():
+                result_nl[tier_idx] = value.strip()
+        return result_nl
 
     normalized = _TIER_SEMICOLON.sub(" / ", consolidated)
     result: dict[int, str] = {}
@@ -441,6 +496,12 @@ def apply_post_processing(
         if "RX" in key and isinstance(val, str):
             if val.strip().lower() in _NOT_COVERED_PHRASES:
                 result[key] = ""
+            # RX Deductible fields: a zero/none deductible means "no RX deductible"
+            # -> empty string ("$0", "0", "None", "No deductible" are all noise).
+            elif key.endswith("RX Deductible") and val.strip().lower() in (
+                "$0", "0", "none", "no deductible", "does not apply"
+            ):
+                result[key] = ""
 
     # Pass 1b: HMO/EPO plans have no OON drug benefit -- clear OON RX fields.
     network_type = (result.get("Network Type") or "").strip().lower()
@@ -468,7 +529,16 @@ def apply_post_processing(
         if net_prefix == "In-Network" and preferred_rx:
             tier_values = _merge_preferred_and_inn_tier_values(preferred_rx, consolidated)
         else:
-            tier_values = _extract_tier_values(consolidated)
+            tier_values, explicit_mail = _extract_tier_values_with_mail(consolidated)
+            # Explicit '(retail)/(mail order)' qualifiers in the document are
+            # authoritative: rebuild the Mail Order field from them, overriding
+            # the VLM's own attribution (it sometimes includes retail-only tiers).
+            if net_prefix == "In-Network" and explicit_mail:
+                mo_field = "In-Network Mail Order RX"
+                if mo_field in output_field_names:
+                    result[mo_field] = " / ".join(
+                        _strip_rx_suffix(explicit_mail[i]) for i in sorted(explicit_mail)
+                    )
         for i, suffix in enumerate(_TIER_SUFFIXES):
             field_name = f"{net_prefix} {suffix}"
             if field_name in output_field_names:
@@ -476,6 +546,33 @@ def apply_post_processing(
                 # Strip "copay per prescription..." verbosity from 2-column plan values
                 # (3-column values are already stripped inside _merge_preferred_and_inn_tier_values)
                 result[field_name] = _strip_rx_suffix(v) if v else v
+
+    # Pass 2b: drop retail coinsurance values the VLM copied into Mail Order.
+    # A mail-order part that verbatim-equals a retail per-tier value AND is a
+    # coinsurance expression is almost certainly a retail-only tier (typically
+    # Specialty, "Up to a 30-day supply (retail)") wrongly attributed to mail
+    # order — flat-dollar duplicates are left alone since 90-day mail prices
+    # can legitimately coincide with retail dollars.
+    def _canon(s: str) -> str:
+        s = re.sub(r'\s*/?\s*(?:per\s+)?prescription\b', '', s.lower())
+        return re.sub(r'\s+', ' ', s).strip(' ,.')
+
+    retail_tier_values = {
+        _canon(result.get(f"{np} {sfx}") or "")
+        for np in ("In-Network", "Out-of-Network", "Designated Network")
+        for sfx in _TIER_SUFFIXES
+    } - {""}
+    for mo_field in _MAIL_ORDER_RX_FIELDS:
+        val = result.get(mo_field)
+        if isinstance(val, str) and val and retail_tier_values:
+            kept = [
+                p for p in (part.strip() for part in val.split(" / "))
+                if p and _canon(p) and not (
+                    ("%" in p or "coinsurance" in p.lower())
+                    and _canon(p) in retail_tier_values
+                )
+            ]
+            result[mo_field] = " / ".join(kept)
 
     # Pass 3: strip tier labels from Mail Order RX fields.
     # Mail Order fields display 90-day costs as "$20 / $80", not "Tier 1: $20 / Tier 2: $80".

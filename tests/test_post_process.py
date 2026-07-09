@@ -2,7 +2,9 @@
 from app.post_process import (
     COMPUTED_FIELD_NAMES,
     _extract_tier_values,
+    _extract_tier_values_with_mail,
     _label_to_tier_index,
+    _split_retail_mail,
     _strip_tier_labels,
     apply_post_processing,
     vlm_field_names,
@@ -127,6 +129,90 @@ def test_non_rx_categories_unaffected():
     dental = CATEGORY_FIELDS["dental"]
     assert "In-Network Cleanings" in dental
     assert "In-Network RX" not in dental
+
+
+# ── Explicit (retail)/(mail order) qualifier handling ────────────────────────
+
+class TestSplitRetailMail:
+    def test_kaiser_pattern_with_prescription_suffix(self):
+        r, m = _split_retail_mail("$5 / prescription (retail), $10 / prescription (mail order)")
+        assert r == "$5"
+        assert m == "$10"
+
+    def test_simple_pattern(self):
+        r, m = _split_retail_mail("$15 (retail), $30 (mail order)")
+        assert r == "$15"
+        assert m == "$30"
+
+    def test_unqualified_value_unchanged(self):
+        r, m = _split_retail_mail("10% coinsurance up to $250 / prescription")
+        assert r == "10% coinsurance up to $250 / prescription"
+        assert m is None
+
+    def test_retail_only_qualifier_unchanged(self):
+        """A lone '(retail)' without a mail-order counterpart is not split."""
+        r, m = _split_retail_mail("$20 copay (retail)")
+        assert r == "$20 copay (retail)"
+        assert m is None
+
+
+class TestNewlineSeparatedTiers:
+    """VLM sometimes separates tiers with newlines; ' / ' inside a line is
+    then part of the value (e.g. '$250 / prescription'), not a separator."""
+
+    def test_kaiser_newline_output(self):
+        s = ("Generic (Tier 1): $5 / prescription (retail)\n"
+             "Preferred Brand (Tier 2): $15 / prescription (retail)\n"
+             "Non-preferred Brand (Tier 2): $15 / prescription (retail)\n"
+             "Specialty Drugs (Tier 4): 10% coinsurance up to $250 / prescription")
+        tv = _extract_tier_values(s)
+        assert tv[0] == "$5 / prescription (retail)"
+        assert tv[1] == "$15 / prescription (retail)"
+        assert tv[2] == "$15 / prescription (retail)"  # Non-preferred Brand → Tier 3
+        assert tv[3] == "10% coinsurance up to $250 / prescription"
+
+    def test_with_mail_extraction_from_newline_output(self):
+        s = ("Generic (Tier 1): $5 / prescription (retail), $10 / prescription (mail order)\n"
+             "Preferred Brand (Tier 2): $15 / prescription (retail), $30 / prescription (mail order)\n"
+             "Specialty Drugs (Tier 4): 10% coinsurance up to $250 / prescription")
+        retail, mail = _extract_tier_values_with_mail(s)
+        assert retail[0] == "$5"
+        assert retail[1] == "$15"
+        assert retail[3] == "10% coinsurance up to $250 / prescription"
+        assert mail == {0: "$10", 1: "$30"}   # specialty has no mail order
+
+
+class TestExplicitMailOverridesVlmAttribution:
+    """When the doc marks values '(retail)/(mail order)', post-processing rebuilds
+    In-Network Mail Order RX from the markers, overriding VLM attribution."""
+
+    def test_mail_order_rebuilt_from_qualifiers(self):
+        fields = {
+            "Network Type": "HMO",
+            "In-Network RX": (
+                "Generic (Tier 1): $5 / prescription (retail), $10 / prescription (mail order)\n"
+                "Preferred Brand (Tier 2): $15 / prescription (retail), $30 / prescription (mail order)\n"
+                "Non-preferred Brand (Tier 2): $15 / prescription (retail), $30 / prescription (mail order)\n"
+                "Specialty Drugs (Tier 4): 10% coinsurance up to $250 / prescription"
+            ),
+            # VLM wrongly included specialty's retail-only cost:
+            "In-Network Mail Order RX": "$10 / $30 / $30 / 10% coinsurance up to $250",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "$5"
+        assert result["In-Network Brand RX"] == "$15"
+        assert result["In-Network Tier 3 RX"] == "$15"
+        assert result["In-Network Tier 4 RX"] == "10% coinsurance up to $250 / prescription"
+        assert result["In-Network Mail Order RX"] == "$10 / $30 / $30"  # specialty dropped
+
+    def test_no_qualifiers_leaves_vlm_mail_order_alone(self):
+        fields = {
+            "Network Type": "PPO",
+            "In-Network RX": "Generic: $10 / Brand: $40",
+            "In-Network Mail Order RX": "$25 / $80",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Mail Order RX"] == "$25 / $80"
 
 
 # ── Label-based tier mapping unit tests ──────────────────────────────────────

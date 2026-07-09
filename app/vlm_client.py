@@ -116,6 +116,15 @@ _RX_PROMPT = (
     "'Condition Care Rx: $50 / All Other Preferred Brand: Deductible + $100' becomes "
     "'Preferred Brand: $50 / Deductible + $100'. "
     "Keep the tier label ONCE at the front; never repeat sub-program names.\n\n"
+    "PER-TIER RETAIL vs MAIL ORDER ATTRIBUTION: Decide tier by tier. A tier contributes to "
+    "Mail Order RX ONLY if the document explicitly shows a mail-order price for THAT tier — "
+    "a value marked '(mail order)', a mail-order column entry, or a 90/100-day-supply price. "
+    "If a tier shows only a retail price, or its Limitations column says something like "
+    "'Up to a 30-day supply (retail)', that tier has NO mail-order benefit: skip it in "
+    "Mail Order RX entirely — never copy its retail cost there. "
+    "Example: Generic '$5 (retail), $10 (mail order)' / Brand '$15 (retail), $30 (mail order)' / "
+    "Specialty '10% coinsurance up to $250' with limitation 'Up to a 30-day supply (retail)' "
+    "-> In-Network Mail Order RX = '$10 / $30' (specialty omitted — retail only).\n\n"
     "NEVER CALCULATE MAIL ORDER PRICES: Only populate Mail Order RX with dollar amounts "
     "explicitly PRINTED in the document as mail-order prices. Limitation notes like "
     "'Up to 30 day supply for retail, 90 day supply for mail order at 2 times the retail amount' "
@@ -165,6 +174,11 @@ _RX_PROMPT = (
     "    Preferred Network RX = 'Tier 2 - Typically Preferred Brand: $80' (retail only)\n"
     "    In-Network RX        = 'Tier 2 - Typically Preferred Brand: $90' (retail only)\n"
     "    In-Network Mail Order RX = '$200' (home delivery from Preferred col, cost-only)"
+    "\n\nFINAL CHECK before answering: for EVERY value you wrote in a Mail Order RX field, "
+    "verify that the exact dollar amount appears verbatim in the document as a printed "
+    "mail-order price. If any amount does not appear verbatim (e.g. you doubled a retail "
+    "price because of a '2 times the retail amount' note), set that Mail Order RX field "
+    "to '' instead."
 )
 
 
@@ -191,6 +205,7 @@ async def _chat_completion(messages: list[dict], *, extra_body: dict | None = No
         "model": settings.VLM_MODEL,
         "messages": messages,
         "temperature": 0.0,
+        "seed": 0,  # pin sampling seed — reduces run-to-run output variance
     }
     if extra_body:
         payload["extra_body"] = extra_body

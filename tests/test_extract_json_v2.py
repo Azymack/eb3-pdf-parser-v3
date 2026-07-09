@@ -324,7 +324,7 @@ async def test_rx_tier_string_passed_through_to_response(mock_pipeline):
     body = response.json()
     # New field present, value passed through verbatim
     assert body["In-Network RX"] == "Tier 1 (Generic): $10 / Tier 2 (Brand): $40 / Tier 3: 50%"
-    assert body["In-Network Mail Order RX"] == "Tier 1: $20 / Tier 2: $80"
+    assert body["In-Network Mail Order RX"] == "$20 / $80"  # labels stripped by Pass 3
     # Per-tier fields now appear (computed from consolidated), mail-order tier variants never should
     assert "In-Network Generic RX" in body  # computed from In-Network RX
     assert "In-Network Generic Mail Order RX" not in body
