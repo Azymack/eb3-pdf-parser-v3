@@ -32,6 +32,7 @@ Pass 3 — Mail Order RX label stripping:
     Brand (non-preferred) suffix form → Tier 3 RX  ("Brand Drugs (Non-Preferred)")
     Non-Preferred Generic → Generic RX (merged with Preferred Generic)
     Generic (non-preferred) suffix form → Generic RX (merged)
+    Specialty Prescription Drug Product Tier Level rows → Tier 5 RX (joined)
     Non-Preferred Specialty → Tier 5 RX
     Specialty / Preferred Specialty → Tier 4 RX
     Generic / Preferred Generic → Generic RX (Tier 1)
@@ -147,6 +148,24 @@ def _has_standalone_preferred(n: str) -> bool:
     return bool(re.search(r'\bpreferred\b', without))
 
 
+def _leading_dollar_amount(value: str) -> float | None:
+    m = re.search(r'\$(\d[\d,]*(?:\.\d+)?)', value)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", ""))
+
+
+def _is_specialty_product_tier_label(label: str) -> bool:
+    """Labels from a separate Specialty Prescription Drug Product tier table."""
+    n = _normalize_tier_label(label)
+    return (
+        "specialty prescription drug product tier level" in n
+        or "specialty prescription drug product" in n
+        or bool(re.search(r"specialty\s+prescription\s+drug", n))
+        or bool(re.search(r"specialty\s+tier\s*\d", n))
+    )
+
+
 def _is_combined_sbc_tier_row(label: str) -> bool:
     """SBC rows that merge preferred + non-preferred drug types under one tier label."""
     n = _normalize_tier_label(label)
@@ -231,6 +250,10 @@ def _label_to_tier_index(label: str) -> int | None:
     # "Generic (Preventive): No Charge" alongside "Generic: $20"). The standard
     # tier cost is what we want; skipping preventive labels lets the next entry win.
     if re.search(r'\bpreventive\b', n):
+        return None
+
+    # ── Separate specialty-product tier table → handled as Tier 5 aggregate ───
+    if _is_specialty_product_tier_label(label):
         return None
 
     # ── Priority 1: Non-Preferred Brand → ALWAYS Tier 3 ──────────────────────
@@ -760,6 +783,84 @@ def _strip_rx_suffix(value: str) -> str:
     return " / ".join(stripped)
 
 
+def _iter_labeled_rx_parts(consolidated: str) -> list[tuple[str, str]]:
+    """Yield (label, value) pairs from a consolidated RX string."""
+    if not consolidated:
+        return []
+    parts: list[tuple[str, str]] = []
+    if "\n" in consolidated:
+        chunks = consolidated.splitlines()
+    else:
+        chunks = _TIER_SEMICOLON.sub(" / ", consolidated).split(" / ")
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if ": " in chunk and chunk[0].isalpha():
+            label, _, value = chunk.partition(": ")
+            parts.append((label.strip(), value.strip()))
+    return parts
+
+
+def _extract_specialty_product_tier5_from_consolidated(consolidated: str) -> str:
+    """Collect Specialty Prescription Drug Product tier costs into one Tier 5 value."""
+    parts: list[str] = []
+    for label, value in _iter_labeled_rx_parts(consolidated):
+        if not _is_specialty_product_tier_label(label):
+            continue
+        v = _normalize_tier_retail_value(value)
+        if v and v.strip().lower() not in _NOT_COVERED_PHRASES:
+            parts.append(v)
+    return " / ".join(parts)
+
+
+def _is_separate_specialty_pharmacy_table(preferred_rx: str, inn_rx: str) -> bool:
+    """Detect main retail table (INN) plus separate specialty tier table (Preferred).
+
+    UnitedHealthcare-style documents show:
+      - Prescription Drug Product Tier Level → In-Network RX (Tiers 1-4)
+      - Specialty Prescription Drug Product Tier Level → Preferred Network RX
+    """
+    pref_raw = _extract_tier_values(preferred_rx)
+    inn_raw = _extract_tier_values(inn_rx)
+    if not pref_raw or not inn_raw:
+        return False
+    pref = {idx: _normalize_tier_retail_value(v) for idx, v in pref_raw.items()}
+    inn = {idx: _normalize_tier_retail_value(v) for idx, v in inn_raw.items()}
+    main_slots = {idx for idx in inn if idx <= 3}
+    pref_slots = {idx for idx in pref if idx <= 3}
+    if len(main_slots) < 3 or len(pref_slots) < 3:
+        return False
+    if 0 in pref and 0 in inn and pref[0] != inn[0]:
+        return False
+    divergent = 0
+    for idx in (1, 2, 3):
+        if idx in pref and idx in inn and pref[idx] != inn[idx]:
+            divergent += 1
+    if divergent < 2:
+        return False
+    for idx in (1, 2, 3):
+        if idx not in pref or idx not in inn:
+            continue
+        p_amt = _leading_dollar_amount(pref[idx])
+        i_amt = _leading_dollar_amount(inn[idx])
+        if p_amt is not None and i_amt is not None and p_amt < i_amt:
+            return False
+    return True
+
+
+def _build_tier5_from_specialty_table(rx: str) -> str:
+    """Join Tier 1-4 costs from a specialty pharmacy table into Tier 5 RX."""
+    explicit = _extract_specialty_product_tier5_from_consolidated(rx)
+    if explicit:
+        return explicit
+    parts: list[str] = []
+    raw = _extract_tier_values(rx)
+    for idx in sorted(k for k in raw if k <= 3):
+        v = _normalize_tier_retail_value(raw[idx])
+        if v and v.strip().lower() not in _NOT_COVERED_PHRASES:
+            parts.append(v)
+    return " / ".join(parts)
+
+
 def _merge_preferred_and_inn_tier_values(
     preferred_rx: str, inn_rx: str
 ) -> dict[int, str]:
@@ -831,9 +932,15 @@ def apply_post_processing(
     # health_3tier: Designated Network RX, In-Network RX, and Out-of-Network RX each
     # feed their own per-tier fields — no cross-column merge.
     preferred_rx = result.get("Preferred Network RX") or ""
+    inn_rx = result.get("In-Network RX") or ""
     designated_tier_fields = any(
         f"Designated Network {suffix}" in output_field_names
         for suffix in _TIER_SUFFIXES
+    )
+    specialty_pharmacy_table = (
+        not designated_tier_fields
+        and preferred_rx
+        and _is_separate_specialty_pharmacy_table(preferred_rx, inn_rx)
     )
     net_prefixes: tuple[str, ...] = (
         ("Designated Network", "In-Network", "Out-of-Network")
@@ -845,9 +952,16 @@ def apply_post_processing(
     for ref_prefix in net_prefixes:
         ref_rx = result.get(f"{ref_prefix} RX") or ""
         if ref_prefix == "In-Network" and preferred_rx and not designated_tier_fields:
-            reference_tier_indices = _merge_preferred_and_inn_tier_values(
-                preferred_rx, ref_rx,
-            )
+            if specialty_pharmacy_table:
+                reference_tier_indices = {
+                    idx: _normalize_tier_retail_value(v)
+                    for idx, v in _extract_tier_values(ref_rx).items()
+                    if idx <= 3
+                }
+            else:
+                reference_tier_indices = _merge_preferred_and_inn_tier_values(
+                    preferred_rx, ref_rx,
+                )
         else:
             reference_tier_indices = _extract_tier_values(ref_rx)
         if reference_tier_indices:
@@ -869,11 +983,26 @@ def apply_post_processing(
             and preferred_rx
             and not designated_tier_fields
         ):
-            tier_values = _merge_preferred_and_inn_tier_values(preferred_rx, consolidated)
+            if specialty_pharmacy_table:
+                tier_values = {
+                    idx: _normalize_tier_retail_value(v)
+                    for idx, v in _extract_tier_values(consolidated).items()
+                    if idx <= 3
+                }
+                tier5 = _build_tier5_from_specialty_table(preferred_rx)
+                if tier5:
+                    tier_values[4] = tier5
+            else:
+                tier_values = _merge_preferred_and_inn_tier_values(preferred_rx, consolidated)
         else:
             tier_values, _explicit_mail = _extract_tier_values_with_mail(
                 consolidated, split_retail_mail_pairs=split_pairs,
             )
+            if net_prefix == "Out-of-Network" and specialty_pharmacy_table:
+                tier_values = {
+                    idx: v for idx, v in tier_values.items() if idx <= 3
+                }
+                tier_values[4] = "Not applicable"
             if (
                 net_prefix == "Out-of-Network"
                 and consolidated.strip()
@@ -886,6 +1015,10 @@ def apply_post_processing(
                     reference_tier_indices,
                     split_retail_mail_pairs=split_pairs,
                 )
+        if net_prefix == "In-Network" and not tier_values.get(4):
+            tier5 = _extract_specialty_product_tier5_from_consolidated(consolidated)
+            if tier5:
+                tier_values[4] = tier5
         for i, suffix in enumerate(_TIER_SUFFIXES):
             field_name = f"{net_prefix} {suffix}"
             if field_name in output_field_names:
@@ -940,6 +1073,7 @@ def apply_post_processing(
     if (
         preferred_rx
         and not designated_tier_fields
+        and not specialty_pharmacy_table
         and "In-Network Mail Order RX" in output_field_names
     ):
         mail_sources = [

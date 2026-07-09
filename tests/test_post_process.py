@@ -364,6 +364,25 @@ class TestExtractTierValues:
 class TestApplyPostProcessingLabelBased:
     """Integration: apply_post_processing with label-based tier mapping."""
 
+    def test_dual_specialty_pharmacy_table_routes_to_tier5(self):
+        """UHC-style: main retail in INN, specialty product tiers in Preferred Network RX."""
+        fields = {
+            "Network Type": "PPO",
+            "In-Network RX": "Tier 1: $10 / Tier 2: $35 / Tier 3: $75 / Tier 4: $250",
+            "Out-of-Network RX": "Tier 1: $10 / Tier 2: $35 / Tier 3: $75 / Tier 4: $250",
+            "Preferred Network RX": "Tier 1: $10 / Tier 2: $150 / Tier 3: $350 / Tier 4: $500",
+            "In-Network Mail Order RX": "$25 / $87.50 / $187.50 / $625",
+            "Out-of-Network Mail Order RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "$10"
+        assert result["In-Network Brand RX"] == "$35"
+        assert result["In-Network Tier 3 RX"] == "$75"
+        assert result["In-Network Tier 4 RX"] == "$250"
+        assert result["In-Network Tier 5 RX"] == "$10 / $150 / $350 / $500"
+        assert result["Out-of-Network Tier 5 RX"] == "Not applicable"
+        assert result["In-Network Mail Order RX"] == "$25 / $87.50 / $187.50 / $625"
+
     def test_non_preferred_brand_routes_to_tier3_not_brand(self):
         fields = {
             "Network Type": "PPO",
