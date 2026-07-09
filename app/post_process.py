@@ -31,6 +31,7 @@ Pass 3 — Mail Order RX label stripping:
     Non-Preferred Generic → Generic RX (merged with Preferred Generic)
     Generic (non-preferred) suffix form → Generic RX (merged)
     Non-Preferred Specialty → Tier 5 RX
+    Specialty Drugs row (standalone, below Tier 4) → Tier 5 RX (joined sub-rows)
     Specialty / Preferred Specialty → Tier 4 RX
     Generic / Preferred Generic → Generic RX (Tier 1)
     Brand / Preferred Brand → Brand RX (Tier 2)
@@ -128,6 +129,31 @@ def _is_non_preferred_tier_label(label: str) -> bool:
     return bool(re.search(r'\bnon\s+preferred\b', _normalize_tier_label(label)))
 
 
+def _explicit_tier_number(label: str) -> int | None:
+    """Extract document tier number from '(Tier N)' or leading 'Tier N' in the label."""
+    m = re.search(r'\(\s*tier\s*(\d+)\s*\)', label, re.I)
+    if m:
+        return int(m.group(1))
+    m = re.match(r'^\s*tier\s*(\d+)\b', label, re.I)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _is_specialty_drugs_row_label(label: str, context_text: str = "") -> bool:
+    """Standalone 'Specialty Drugs' row below Tier 4 — not 'Specialty Drugs (Tier 4)'."""
+    if _explicit_tier_number(label) is not None:
+        return False
+    raw = re.sub(r'\s+', ' ', label.lower().strip())
+    if not re.fullmatch(r'specialty\s+drugs?', raw):
+        return False
+    # Wellmark SBC: numbered Tier 1-4 rows precede the separate Specialty Drugs row.
+    return bool(
+        re.search(r'\btier\s*1\b', context_text)
+        and re.search(r'\btier\s*4\b', context_text)
+    )
+
+
 def _is_plain_tier_label(label: str, kind: str) -> bool:
     """Label contains kind but neither preferred nor non-preferred qualifier."""
     n = _normalize_tier_label(label)
@@ -169,7 +195,7 @@ def _should_merge_duplicate_tier(label: str, tier_idx: int, prev_label: str) -> 
     )
 
 
-def _label_to_tier_index(label: str) -> int | None:
+def _label_to_tier_index(label: str, context_text: str = "") -> int | None:
     """Map a drug tier label string to a 0-based tier index.
 
     Returns:
@@ -219,8 +245,12 @@ def _label_to_tier_index(label: str) -> int | None:
     if re.fullmatch(r'tier\s*5', n):
         return 4
 
+    # ── Standalone Specialty Drugs row (Wellmark SBC below Tier 4) → Tier 5 ─
+    if _is_specialty_drugs_row_label(label, context_text):
+        return 4
+
     # ── Specialty (anything remaining with "specialty") → Tier 4 ─────────────
-    # Catches: "Specialty", "Preferred Specialty", "Specialty Drugs",
+    # Catches: "Specialty", "Preferred Specialty", "Specialty Drugs (Tier 4)",
     #          "Typically Preferred Specialty"
     if 'specialty' in n:
         return 3
@@ -550,7 +580,7 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
             label = label.strip()
             tier_idx = _contextual_tier_index(
                 label,
-                _label_to_tier_index(label),
+                _label_to_tier_index(label, context_text),
                 context_text,
             )
             if tier_idx is not None:
@@ -582,7 +612,7 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
                 continue
             tier_idx = _contextual_tier_index(
                 label,
-                _label_to_tier_index(label),
+                _label_to_tier_index(label, context_text),
                 context_text,
             )
             if tier_idx is not None:

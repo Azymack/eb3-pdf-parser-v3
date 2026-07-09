@@ -8,6 +8,7 @@ from app.post_process import (
     _extract_tier_values,
     _extract_tier_values_with_mail,
     _label_to_tier_index,
+    _normalize_tier_label,
     _normalize_tier_retail_value,
     _split_retail_mail,
     _split_unlabeled_retail_mail,
@@ -260,11 +261,20 @@ class TestLabelToTierIndex:
             assert _label_to_tier_index(label) == 2, f"Expected Tier3 for {label!r}"
 
     def test_specialty_aliases_to_tier4(self):
-        for label in ("Specialty", "Specialty Drugs", "Specialty (Preferred)",
+        for label in ("Specialty", "Specialty (Preferred)",
                       "Tier 4", "Preferred Specialty",
                       "Tier 4 - Typically Preferred Specialty",
-                      "Typically Preferred Specialty"):
+                      "Typically Preferred Specialty",
+                      "Specialty Drugs (Tier 4)"):
             assert _label_to_tier_index(label) == 3, f"Expected Tier4 for {label!r}"
+
+    def test_specialty_drugs_row_to_tier5(self):
+        ctx = _normalize_tier_label(
+            "Tier 1: $30 / Tier 2: $65 / Tier 3: $100 / Tier 4: $240 / Specialty Drugs"
+        )
+        assert _label_to_tier_index("Specialty Drugs", ctx) == 4
+        assert _label_to_tier_index("Specialty drugs", ctx) == 4
+        assert _label_to_tier_index("Specialty Drugs") == 3  # no numbered-tier context
 
     def test_non_preferred_specialty_to_tier5(self):
         for label in ("Non-Preferred Specialty", "Specialty (Non-Preferred)",
@@ -353,6 +363,28 @@ class TestExtractTierValues:
 
 class TestApplyPostProcessingLabelBased:
     """Integration: apply_post_processing with label-based tier mapping."""
+
+    def test_specialty_drugs_row_below_tier4_routes_to_tier5(self):
+        """Wellmark SBC: Specialty Drugs row with Generic/Preferred/Non-Preferred sub-rows."""
+        fields = {
+            "Network Type": "PPO",
+            "In-Network RX": (
+                "Tier 1: $30 / Tier 2: $65 / Tier 3: $100 / Tier 4: $240 / "
+                "Specialty Drugs: Generic: $190 / Preferred: $275 / Non-Preferred: $325"
+            ),
+            "Out-of-Network RX": (
+                "Tier 1: Not covered / Tier 2: Not covered / Tier 3: Not covered / "
+                "Tier 4: Not covered / Specialty Drugs: Not covered"
+            ),
+            "Preferred Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "$30"
+        assert result["In-Network Brand RX"] == "$65"
+        assert result["In-Network Tier 3 RX"] == "$100"
+        assert result["In-Network Tier 4 RX"] == "$240"
+        assert result["In-Network Tier 5 RX"] == "$190 / $275 / $325"
+        assert result["Out-of-Network Tier 5 RX"] == "Not covered"
 
     def test_non_preferred_brand_routes_to_tier3_not_brand(self):
         fields = {
