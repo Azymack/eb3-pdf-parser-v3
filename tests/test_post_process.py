@@ -156,6 +156,11 @@ class TestSplitRetailMail:
         assert r == "$15"
         assert m == "$30"
 
+    def test_adjacent_markers_without_comma(self):
+        r, m = _split_retail_mail("$20 / prescription (retail) $40 / prescription (mail order)")
+        assert r == "$20"
+        assert m == "$40"
+
     def test_unqualified_value_unchanged(self):
         r, m = _split_retail_mail("10% coinsurance up to $250 / prescription")
         assert r == "10% coinsurance up to $250 / prescription"
@@ -231,6 +236,22 @@ class TestExplicitMailOverridesVlmAttribution:
         result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
         assert result["In-Network Mail Order RX"] == "$25 / $80"
 
+    def test_mail_order_rebuilt_from_adjacent_markers(self):
+        fields = {
+            "Network Type": "PPO",
+            "In-Network RX": (
+                "Generic: $20 / prescription (retail) $40 / prescription (mail order) / "
+                "Brand: $50 / prescription (retail) $100 / prescription (mail order) / "
+                "Tier 3: $50 / prescription (retail) $100 / prescription (mail order)"
+            ),
+            "In-Network Mail Order RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "$20"
+        assert result["In-Network Brand RX"] == "$50"
+        assert result["In-Network Tier 3 RX"] == "$50"
+        assert result["In-Network Mail Order RX"] == "$40 / $100 / $100"
+
 
 # ── Label-based tier mapping unit tests ──────────────────────────────────────
 
@@ -271,10 +292,10 @@ class TestLabelToTierIndex:
                       "Tier 5", "Non Preferred Specialty"):
             assert _label_to_tier_index(label) == 4, f"Expected Tier5 for {label!r}"
 
-    def test_non_preferred_generic_to_tier2(self):
-        """Non-Preferred Generic maps to Tier 2 (Brand slot) in split-generic plans."""
-        assert _label_to_tier_index("Non-Preferred Generic") == 1
-        assert _label_to_tier_index("Non-Preferred Generic Drugs") == 1
+    def test_non_preferred_generic_to_generic_rx(self):
+        """Non-Preferred Generic merges into Generic RX (slot 0), not Brand."""
+        assert _label_to_tier_index("Non-Preferred Generic") == 0
+        assert _label_to_tier_index("Non-Preferred Generic Drugs") == 0
 
     def test_preferred_brand_not_confused_with_non_preferred(self):
         """'Preferred Brand' must NOT match the Non-Preferred Brand check."""
