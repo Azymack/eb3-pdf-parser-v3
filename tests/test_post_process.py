@@ -147,6 +147,43 @@ def test_non_rx_categories_unaffected():
 # ── Explicit (retail)/(mail order) qualifier handling ────────────────────────
 
 class TestSplitRetailMail:
+    def test_uhc_word_channel_per_tier_cell(self):
+        cell = "Retail $10 / Mail-Order $20 / Specialty Drugs $10"
+        r, m = _split_retail_mail(cell)
+        assert r == "$10"
+        assert m == "$20"
+        assert _extract_retail_only(cell) == "$10"
+        assert _extract_home_delivery(cell) == "$20"
+
+    def test_bcbs_supply_generic_retail_and_mail(self):
+        cell = (
+            "$10 / retail supply or $20 / mail service supply for low-cost generic drugs; "
+            "$45 / retail supply or $90 / mail service supply for other generic drugs"
+        )
+        r, m = _split_retail_mail(cell)
+        assert r == "$10 / $45"
+        assert m == "$20 / $90"
+        assert _extract_retail_only(cell) == "$10 / $45"
+        assert _extract_home_delivery(cell) == "$20 / $90"
+
+    def test_bcbs_supply_brand_single_clause(self):
+        cell = "$150 / retail supply or $300 / mail service supply"
+        r, m = _split_retail_mail(cell)
+        assert r == "$150"
+        assert m == "$300"
+
+    def test_bcbs_supply_oon_mail_tail_stripped(self):
+        cell = "$20 / retail supply for low-cost generic drugs or $90 / retail supply for other generic drugs and all charges for mail service"
+        r, m = _split_retail_mail(cell)
+        assert r == "$20 / $90"
+        assert m is None
+
+    def test_bcbs_supply_not_covered_mail_omitted(self):
+        cell = "50% coinsurance / retail supply for preferred brand specialty drugs; not covered / mail service supply"
+        r, m = _split_retail_mail(cell)
+        assert r == "50% coinsurance"
+        assert m is None
+
     def test_kaiser_pattern_with_prescription_suffix(self):
         r, m = _split_retail_mail("$5 / prescription (retail), $10 / prescription (mail order)")
         assert r == "$5"
@@ -231,6 +268,58 @@ class TestExplicitMailOverridesVlmAttribution:
         }
         result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
         assert result["In-Network Mail Order RX"] == "$25 / $80"
+
+
+class TestBcbsMaSupplyFormat:
+    """BCBS MA SBC — '/ retail supply' and '/ mail service supply' per drug row."""
+
+    _INN_RX = (
+        "Low-Cost Generic: $10 / retail supply or $20 / mail service supply for low-cost generic drugs; "
+        "$45 / retail supply or $90 / mail service supply for other generic drugs / "
+        "Preferred Brand: $150 / retail supply or $300 / mail service supply / "
+        "Non-Preferred Brand: $225 / retail supply or $675 / mail service supply / "
+        "Specialty Drugs: $10 / retail supply for low-cost generic drugs; "
+        "$45 / retail supply for other generic drugs; "
+        "50% coinsurance / retail supply for preferred brand specialty drugs; "
+        "50% coinsurance / retail supply for non-preferred specialty drugs; "
+        "not covered / mail service supply"
+    )
+
+    _COLLAPSED_INN_RX = (
+        "Low-Cost Generic: $10 / Generic: $45 / Preferred Brand: $150 / "
+        "Non-Preferred Brand: $225 / Specialty Drugs: Low-Cost Generic: $10 / "
+        "Generic: $45 / Preferred: 50% Coinsurance / Non-Preferred: Not Covered"
+    )
+
+    def test_full_supply_text_post_process(self):
+        result = apply_post_processing(
+            {"Network Type": "PPO", "In-Network RX": self._INN_RX},
+            CATEGORY_FIELDS["health"],
+        )
+        assert result["In-Network Generic RX"] == "$10 / $45"
+        assert result["In-Network Brand RX"] == "$150"
+        assert result["In-Network Tier 3 RX"] == "$225"
+        assert result["In-Network Tier 4 RX"] == (
+            "$10 / $45 / 50% coinsurance / 50% coinsurance"
+        )
+        assert result["In-Network Mail Order RX"] == "$20 / $90 / $300 / $675"
+
+    def test_collapsed_vlm_output_post_process(self):
+        result = apply_post_processing(
+            {
+                "Network Type": "PPO",
+                "In-Network RX": self._COLLAPSED_INN_RX,
+                "In-Network Mail Order RX": "$20 / $90 / $300 / $675",
+            },
+            CATEGORY_FIELDS["health"],
+        )
+        assert result["In-Network Generic RX"] == "$10 / $45"
+        assert result["In-Network Brand RX"] == "$150"
+        assert result["In-Network Tier 3 RX"] == "$225"
+        assert result["In-Network Tier 4 RX"] == (
+            "$10 / $45 / 50% Coinsurance / Not Covered"
+        )
+        assert result["In-Network Mail Order RX"] == "$20 / $90 / $300 / $675"
 
 
 # ── Label-based tier mapping unit tests ──────────────────────────────────────
@@ -419,6 +508,27 @@ class TestApplyPostProcessingLabelBased:
         }
         result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
         assert result["In-Network Tier 5 RX"] == "$10 / $150 / $350 / $500"
+
+    def test_uhc_retail_mail_specialty_inline_per_tier_cell(self):
+        """UHC SBC: Retail / Mail-Order / Specialty Drugs word labels inside each tier cell."""
+        fields = {
+            "Network Type": "EPO",
+            "In-Network RX": (
+                "Tier 1 (Generic): Retail $10 / Mail-Order $25 / Specialty Drugs $10 / "
+                "Tier 2 (Mid-Range): Retail $35 / Mail-Order $87.50 / Specialty Drugs $150 / "
+                "Tier 3 (Mid-Range): Retail $70 / Mail-Order $175 / Specialty Drugs $350 / "
+                "Tier 4 (Highest): Retail $150 / Mail-Order $375 / Specialty Drugs $500"
+            ),
+            "Out-of-Network RX": "",
+            "Preferred Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "$10"
+        assert result["In-Network Brand RX"] == "$35"
+        assert result["In-Network Tier 3 RX"] == "$70"
+        assert result["In-Network Tier 4 RX"] == "$150"
+        assert result["In-Network Tier 5 RX"] == "$10 / $150 / $350 / $500"
+        assert result["In-Network Mail Order RX"] == "$25 / $87.50 / $175 / $375"
 
     def test_non_preferred_brand_routes_to_tier3_not_brand(self):
         fields = {

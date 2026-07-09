@@ -388,6 +388,96 @@ def _strip_embedded_specialty_from_value(value: str) -> str:
     return " / ".join(parts)
 
 
+_UHC_RETAIL_MAIL = re.compile(r'^(Retail|Mail[\s-]*Order)\s+(\$.+)$', re.I)
+_UHC_SPECIALTY_INLINE = re.compile(r'^Specialty\s+Drugs?\s*:?\s*(\$.+)$', re.I)
+
+
+def _has_uhc_channel_markers(value: str) -> bool:
+    """UHC SBC cells label channels as 'Retail $X / Mail-Order $Y / Specialty Drugs $Z'."""
+    for part in value.split(" / "):
+        p = part.strip()
+        if _UHC_RETAIL_MAIL.match(p) or _UHC_SPECIALTY_INLINE.match(p):
+            return True
+    return False
+
+
+def _buf_has_uhc_channel_cell(buf: list[str]) -> bool:
+    return _has_uhc_channel_markers(" / ".join(buf))
+
+
+def _split_uhc_channel_segment(segment: str) -> tuple[str | None, str]:
+    segment = segment.strip()
+    m = _UHC_RETAIL_MAIL.match(segment)
+    if m:
+        channel = re.sub(r'[\s-]+', ' ', m.group(1).lower()).strip()
+        return channel, m.group(2).strip()
+    m = _UHC_SPECIALTY_INLINE.match(segment)
+    if m:
+        return "specialty drugs", m.group(1).strip()
+    return None, segment
+
+
+def _split_uhc_retail_mail(value: str) -> tuple[str, str | None]:
+    """UHC per-tier cell: 'Retail $10 / Mail-Order $20 / Specialty Drugs $10'."""
+    retail_parts: list[str] = []
+    mail_parts: list[str] = []
+    other_parts: list[str] = []
+    for part in value.split(" / "):
+        part = part.strip()
+        if not part:
+            continue
+        channel, cost = _split_uhc_channel_segment(part)
+        if channel == "retail":
+            retail_parts.append(cost)
+        elif channel and channel.startswith("mail"):
+            mail_parts.append(cost)
+        elif channel and channel.startswith("specialty"):
+            continue
+        else:
+            other_parts.append(part)
+    if retail_parts:
+        retail = " / ".join(retail_parts)
+    elif other_parts:
+        retail = " / ".join(other_parts)
+    else:
+        retail = value
+    mail = " / ".join(mail_parts) if mail_parts else None
+    return retail, mail
+
+
+def _strip_inline_specialty_words(value: str) -> tuple[str, list[str]]:
+    """Pull 'Specialty Drugs $X' channel segments out of a tier cell value."""
+    specialty_parts: list[str] = []
+    kept: list[str] = []
+    for part in value.split(" / "):
+        part = part.strip()
+        if not part:
+            continue
+        channel, cost = _split_uhc_channel_segment(part)
+        if channel and channel.startswith("specialty"):
+            if cost:
+                specialty_parts.append(cost)
+        else:
+            kept.append(part)
+    return " / ".join(kept), specialty_parts
+
+
+def _is_inline_specialty_segment(seg: str, buf: list[str]) -> bool:
+    """Single-tier Specialty Drugs cost inside a Retail/Mail-Order cell — not Tier 5 row."""
+    if not buf or not _buf_has_uhc_channel_cell(buf):
+        return False
+    seg = seg.strip()
+    m = _UHC_SPECIALTY_INLINE.match(seg)
+    if m:
+        cost = m.group(1).strip()
+        return bool(cost) and not re.search(r'\s/\s+\$', cost)
+    m = re.match(r'^Specialty\s+Drugs?\s*:\s*(.+)$', seg, re.I)
+    if not m:
+        return False
+    cost = m.group(1).strip()
+    return bool(cost) and not re.search(r'\s/\s+\$', cost)
+
+
 def _apply_embedded_specialty_tier5(tier_values: dict[int, str]) -> dict[int, str]:
     """Move (Specialty Drugs: $X) fragments from tier 1-4 cells into Tier 5 RX."""
     if not tier_values:
@@ -406,7 +496,9 @@ def _apply_embedded_specialty_tier5(tier_values: dict[int, str]) -> dict[int, st
         for part in val.split(" / "):
             for match in _PAREN_SPECIALTY_DRUGS.finditer(part):
                 specialty_parts.append(match.group(1).strip())
-        result[idx] = _strip_embedded_specialty_from_value(val)
+        cleaned, inline_specialty = _strip_inline_specialty_words(val)
+        specialty_parts.extend(inline_specialty)
+        result[idx] = _strip_embedded_specialty_from_value(cleaned)
 
     if specialty_parts:
         result[4] = " / ".join(specialty_parts)
@@ -449,6 +541,168 @@ def _parse_retail_tier_values(
 # Parenthetical channel markers — carriers use many synonyms.
 _MAIL_CHANNEL = re.compile(r'\(\s*(?:mail[\s-]*order|home\s+delivery)\s*\)', re.I)
 _RETAIL_CHANNEL = re.compile(r'\(\s*retail(?:\s+only)?\s*\)', re.I)
+_SUPPLY_RETAIL = re.compile(r'/\s*retail\s+supply\b', re.I)
+_SUPPLY_MAIL = re.compile(r'/\s*mail\s+service\s+supply\b', re.I)
+
+
+def _has_supply_channel_markers(value: str) -> bool:
+    return bool(_SUPPLY_RETAIL.search(value) or _SUPPLY_MAIL.search(value))
+
+
+def _extract_cost_from_supply_segment(segment: str) -> str:
+    """'$10 / retail supply for ...' -> '$10'; '50% coinsurance / retail supply' -> '50% coinsurance'."""
+    segment = segment.strip()
+    for pattern in (r'^(.*?)\s*/\s*retail\s+supply\b', r'^(.*?)\s*/\s*mail\s+service\s+supply\b'):
+        m = re.match(pattern, segment, re.I)
+        if m:
+            return m.group(1).strip()
+    return segment
+
+
+def _strip_oon_mail_service_tail(clause: str) -> str:
+    return re.sub(r'\s+and\s+all\s+charges\s+for\s+mail\s+service.*$', '', clause, flags=re.I).strip()
+
+
+def _split_retail_mail_supply_clause(clause: str) -> tuple[str, str | None]:
+    """Split one BCBS-style clause with '/ retail supply' and '/ mail service supply'."""
+    clause = _strip_oon_mail_service_tail(clause.strip())
+    if not clause:
+        return "", None
+
+    if re.search(
+        r'/\s*retail\s+supply\b.*?\bor\b.*?/\s*mail\s+service\s+supply\b',
+        clause, re.I,
+    ):
+        retail_seg, mail_seg = re.split(r'\s+or\s+', clause, maxsplit=1, flags=re.I)
+        return (
+            _extract_cost_from_supply_segment(retail_seg),
+            _extract_cost_from_supply_segment(mail_seg) or None,
+        )
+
+    if _SUPPLY_RETAIL.search(clause) and not _SUPPLY_MAIL.search(clause):
+        if re.search(r'\s+or\s+', clause, re.I):
+            parts = [
+                _extract_cost_from_supply_segment(seg)
+                for seg in re.split(r'\s+or\s+', clause, flags=re.I)
+                if seg.strip()
+            ]
+            return " / ".join(parts), None
+        return _extract_cost_from_supply_segment(clause), None
+
+    if _SUPPLY_MAIL.search(clause) and not _SUPPLY_RETAIL.search(clause):
+        return "", _extract_cost_from_supply_segment(clause)
+
+    if _SUPPLY_RETAIL.search(clause):
+        return _extract_cost_from_supply_segment(clause), None
+    return clause, None
+
+
+def _split_retail_mail_supply_value(value: str) -> tuple[str, str | None]:
+    """BCBS MA cells: '$10 / retail supply or $20 / mail service supply; ...'."""
+    retail_parts: list[str] = []
+    mail_parts: list[str] = []
+    for clause in re.split(r'\s*;\s*', value):
+        if not clause.strip():
+            continue
+        retail, mail = _split_retail_mail_supply_clause(clause)
+        if retail:
+            retail_parts.append(retail)
+        if mail and not _is_not_covered_mail_fragment(mail):
+            mail_parts.append(mail)
+    if not retail_parts and not mail_parts:
+        return value, None
+    return " / ".join(retail_parts), (" / ".join(mail_parts) if mail_parts else None)
+
+
+def _is_specialty_subrow_label(label: str) -> bool:
+    """Short sub-labels inside a Specialty Drugs cell — not tier boundaries."""
+    n = _normalize_tier_label(label)
+    if n in {"generic", "preferred", "non-preferred"}:
+        return True
+    return bool(re.match(r'^low[- ]cost\s+generic\b', n))
+
+
+def _specialty_value_has_inline_subrows(value: str) -> bool:
+    for segment in value.split(" / "):
+        sub, _ = _split_sublabel(segment.strip())
+        if sub is not None and _is_specialty_subrow_label(sub):
+            return True
+    return False
+
+
+def _collapse_inline_subrow_costs(value: str) -> str:
+    """'Low-Cost Generic: $10 / Generic: $45 / Preferred: 50%' -> '$10 / $45 / 50%'."""
+    parts: list[str] = []
+    for segment in (s.strip() for s in value.split(" / ") if s.strip()):
+        sub, cost = _split_sublabel(segment)
+        if sub is not None and "$" not in sub and "%" not in sub:
+            if _is_preventive(sub):
+                continue
+            parts.append(cost)
+        else:
+            parts.append(segment)
+    return " / ".join(parts)
+
+
+def _is_not_covered_mail_fragment(value: str) -> bool:
+    return value.strip().lower() in _NOT_COVERED_PHRASES
+
+
+def _split_consolidated_tier_parts(consolidated: str) -> list[str]:
+    """Split consolidated RX on tier boundaries without breaking in-cell '/ retail supply'
+    or Specialty Drugs sub-rows (Generic / Preferred / Non-Preferred)."""
+    if not consolidated:
+        return []
+    normalized = _TIER_SEMICOLON.sub(" / ", consolidated)
+    context_text = _normalize_tier_label(consolidated)
+    segments = [s.strip() for s in normalized.split(" / ") if s.strip()]
+    parts: list[str] = []
+    buf: list[str] = []
+    inside_specialty_cell = False
+
+    def flush() -> None:
+        nonlocal buf
+        if buf:
+            parts.append(" / ".join(buf))
+            buf = []
+
+    for seg in segments:
+        if buf and _is_inline_specialty_segment(seg, buf):
+            buf.append(seg)
+            continue
+        is_labeled = ": " in seg and seg[0].isalpha()
+        if is_labeled:
+            label, _, _ = seg.partition(": ")
+            label = label.strip()
+            tier_idx = _label_to_tier_index(label, context_text)
+            if tier_idx is not None:
+                is_specialty_row = "specialty" in _normalize_tier_label(label)
+                if inside_specialty_cell and _is_specialty_subrow_label(label):
+                    buf.append(seg)
+                    continue
+                flush()
+                buf = [seg]
+                inside_specialty_cell = is_specialty_row
+                continue
+            flush()
+            buf = [seg]
+            continue
+        if buf:
+            buf.append(seg)
+        else:
+            buf = [seg]
+    flush()
+    return parts
+
+
+def _should_merge_generic_slot(label: str, tier_idx: int, prev_label: str) -> bool:
+    """Merge distinct generic rows (e.g. Low-Cost Generic + Generic) into Generic RX."""
+    return (
+        tier_idx == 0
+        and _is_generic_label(label)
+        and _is_generic_label(prev_label)
+        and label != prev_label
+    )
 
 
 def _split_retail_mail(value: str) -> tuple[str, str | None]:
@@ -465,6 +719,10 @@ def _split_retail_mail(value: str) -> tuple[str, str | None]:
     """
     if not value:
         return value, None
+    if _has_supply_channel_markers(value):
+        return _split_retail_mail_supply_value(value)
+    if _has_uhc_channel_markers(value):
+        return _split_uhc_retail_mail(value)
     if not (_RETAIL_CHANNEL.search(value) and _MAIL_CHANNEL.search(value)):
         return value, None
     # "X (retail) and Y (home delivery)" — handled by _extract_home_delivery
@@ -491,6 +749,12 @@ def _extract_retail_only(value: str) -> str:
     """
     if not value:
         return value
+    if _has_supply_channel_markers(value):
+        retail, _ = _split_retail_mail_supply_value(value)
+        return retail
+    if _has_uhc_channel_markers(value):
+        retail, _ = _split_uhc_retail_mail(value)
+        return retail
     # Dual-cost: "X (retail) and Y (home delivery|mail order)" — keep X only
     m = re.match(r'^(.*?)\s*\(\s*retail\s*\)\s+and\b.*', value, re.IGNORECASE | re.DOTALL)
     if m:
@@ -516,6 +780,12 @@ def _extract_home_delivery(value: str) -> str:
     """
     if not value:
         return ""
+    if _has_supply_channel_markers(value):
+        _, mail = _split_retail_mail_supply_value(value)
+        return mail or ""
+    if _has_uhc_channel_markers(value):
+        _, mail = _split_uhc_retail_mail(value)
+        return mail or ""
     if re.search(r'\(\s*retail\s+only\s*\)', value, re.I):
         return ""
     m = re.search(
@@ -669,9 +939,17 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
             )
             if tier_idx is not None:
                 if tier_idx not in result_nl:
-                    result_nl[tier_idx] = value.strip()
+                    stored = value.strip()
+                    if tier_idx in (3, 4) and "specialty" in _normalize_tier_label(label):
+                        if _specialty_value_has_inline_subrows(stored):
+                            stored = _collapse_inline_subrow_costs(stored)
+                    result_nl[tier_idx] = stored
                     labels_nl[tier_idx] = label
                 elif _should_merge_duplicate_tier(label, tier_idx, labels_nl[tier_idx]):
+                    result_nl[tier_idx] = _merge_split_tier_value(
+                        result_nl[tier_idx], value.strip(),
+                    )
+                elif _should_merge_generic_slot(label, tier_idx, labels_nl[tier_idx]):
                     result_nl[tier_idx] = _merge_split_tier_value(
                         result_nl[tier_idx], value.strip(),
                     )
@@ -683,7 +961,7 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
     last_mapped_idx: int | None = None  # most recent successfully mapped tier index
     subrow_mode = False                 # last mapped tier has program sub-rows
 
-    for part in normalized.split(" / "):
+    for part in _split_consolidated_tier_parts(consolidated):
         part = part.strip()
         if not part:
             continue
@@ -706,7 +984,11 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
                     if nested and _is_preventive(sub):
                         result[tier_idx] = ""   # anchored; awaiting non-preventive sub-rows
                     else:
-                        result[tier_idx] = cost if nested else value
+                        stored = cost if nested else value
+                        if tier_idx in (3, 4) and "specialty" in _normalize_tier_label(label):
+                            if _specialty_value_has_inline_subrows(value):
+                                stored = _collapse_inline_subrow_costs(value)
+                        result[tier_idx] = stored
                     tier_labels[tier_idx] = label
                     last_mapped_idx = tier_idx
                     subrow_mode = nested
@@ -715,6 +997,10 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
                     if not (nested and _is_preventive(sub)):
                         result[tier_idx] = _join_tier_value(result[tier_idx], cost)
                 elif _should_merge_duplicate_tier(label, tier_idx, tier_labels[tier_idx]):
+                    addition = cost if nested else value
+                    result[tier_idx] = _merge_split_tier_value(result[tier_idx], addition)
+                    last_mapped_idx = tier_idx
+                elif _should_merge_generic_slot(label, tier_idx, tier_labels[tier_idx]):
                     addition = cost if nested else value
                     result[tier_idx] = _merge_split_tier_value(result[tier_idx], addition)
                     last_mapped_idx = tier_idx
