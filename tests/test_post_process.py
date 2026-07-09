@@ -271,10 +271,21 @@ class TestLabelToTierIndex:
                       "Tier 5", "Non Preferred Specialty"):
             assert _label_to_tier_index(label) == 4, f"Expected Tier5 for {label!r}"
 
-    def test_non_preferred_generic_to_tier2(self):
-        """Non-Preferred Generic maps to Tier 2 (Brand slot) in split-generic plans."""
-        assert _label_to_tier_index("Non-Preferred Generic") == 1
-        assert _label_to_tier_index("Non-Preferred Generic Drugs") == 1
+    def test_non_preferred_generic_to_generic_rx(self):
+        """Non-Preferred Generic merges into Generic RX (slot 0), not Brand."""
+        assert _label_to_tier_index("Non-Preferred Generic") == 0
+        assert _label_to_tier_index("Non-Preferred Generic Drugs") == 0
+        assert _label_to_tier_index("Generic Drugs (Non-Preferred)") == 0
+
+    def test_brand_non_preferred_suffix_to_tier3(self):
+        assert _label_to_tier_index("Brand Drugs (Non-Preferred)") == 2
+        assert _label_to_tier_index("Brand drugs (non-preferred)") == 2
+        assert _label_to_tier_index("Brand drugs (non-preffered)") == 2
+        assert _label_to_tier_index("Brand drugs (nonpreferred)") == 2
+
+    def test_speciality_typo_to_tier5(self):
+        assert _label_to_tier_index("Speciality drugs (non-preferred)") == 4
+        assert _label_to_tier_index("Speciality drugs (non-preffered)") == 4
 
     def test_preferred_brand_not_confused_with_non_preferred(self):
         """'Preferred Brand' must NOT match the Non-Preferred Brand check."""
@@ -440,6 +451,66 @@ class TestMailOrderStrippedByPostProcessing:
         }
         result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
         assert result["In-Network Mail Order RX"] == "$25 / $80"
+
+
+class TestSixTierPreferredNonPreferredSplit:
+    """BCBS TX 1769090950 — 6-row preferred/non-preferred pharmacy table."""
+
+    _INN_RX = (
+        "Generic drugs (preferred): Retail - Preferred Participating - 10% Coinsurance "
+        "Participating - 20% coinsurance / "
+        "Generic drugs (non-preferred): Retail - Preferred Participating - 10% Coinsurance "
+        "Participating - 20% coinsurance / "
+        "Brand drugs (preferred): Retail - Preferred Participating - 20% Coinsurance "
+        "Participating - 30% coinsurance / "
+        "Brand drugs (non-preferred): Retail - Preferred Participating - 30% Coinsurance "
+        "Participating - 40% coinsurance / "
+        "Specialty drugs (preferred): 40% coinsurance / "
+        "Specialty drugs (non-preferred): 50% coinsurance"
+    )
+
+    def test_tier3_gets_non_preferred_brand(self):
+        tv = _extract_tier_values(self._INN_RX)
+        assert "30% Coinsurance Participating - 40% coinsurance" in tv[2]
+        assert tv[1] == (
+            "Retail - Preferred Participating - 20% Coinsurance Participating - 30% coinsurance"
+        )
+
+    def test_generic_merges_preferred_and_non_preferred(self):
+        tv = _extract_tier_values(self._INN_RX)
+        assert "10% Coinsurance" in tv[0]
+        assert "20% coinsurance" in tv[0]
+        # Identical preferred/non-preferred costs collapse to one value
+        assert tv[0] == (
+            "Retail - Preferred Participating - 10% Coinsurance Participating - 20% coinsurance"
+        )
+
+    def test_generic_merge_keeps_both_when_different(self):
+        s = (
+            "Generic drugs (preferred): $10 / "
+            "Generic drugs (non-preferred): $20"
+        )
+        tv = _extract_tier_values(s)
+        assert tv[0] == "$10 / $20"
+
+    def test_full_post_process_bcbs_six_tier(self):
+        fields = {
+            "Network Type": "PPO",
+            "In-Network RX": self._INN_RX,
+            "Out-of-Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Tier 3 RX"] == (
+            "Retail - Preferred Participating - 30% Coinsurance Participating - 40% coinsurance"
+        )
+        assert result["In-Network Brand RX"] == (
+            "Retail - Preferred Participating - 20% Coinsurance Participating - 30% coinsurance"
+        )
+        assert result["In-Network Tier 4 RX"] == "40% coinsurance"
+        assert result["In-Network Tier 5 RX"] == "50% coinsurance"
+        assert result["In-Network Generic RX"] == (
+            "Retail - Preferred Participating - 10% Coinsurance Participating - 20% coinsurance"
+        )
 
 
 class TestChannelSplitting:

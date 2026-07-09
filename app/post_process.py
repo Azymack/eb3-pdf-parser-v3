@@ -27,17 +27,17 @@ Pass 3 — Mail Order RX label stripping:
 
   Tier assignment rules (in priority order):
     Non-Preferred Brand  → Tier 3 RX  (ALWAYS, even if doc numbers it Tier 2)
-    Non-Preferred Generic → Brand RX   (Tier 2 in split-generic plans)
+    Brand (non-preferred) suffix form → Tier 3 RX  ("Brand Drugs (Non-Preferred)")
+    Non-Preferred Generic → Generic RX (merged with Preferred Generic)
+    Generic (non-preferred) suffix form → Generic RX (merged)
     Non-Preferred Specialty → Tier 5 RX
     Specialty / Preferred Specialty → Tier 4 RX
     Generic / Preferred Generic → Generic RX (Tier 1)
     Brand / Preferred Brand → Brand RX (Tier 2)
     Bare "Tier N" labels without a descriptor → positional by number
 
-  This means a document that skips Preferred Brand entirely and only has
-  Generic + Non-Preferred Brand + Specialty produces:
-    Generic RX=$X, Brand RX="", Tier 3 RX=$Y, Tier 4 RX=$Z
-  rather than the wrong positional: Generic=$X, Brand=$Y, Tier 3=$Z.
+  When a plan splits Generic into Preferred + Non-Preferred rows, both map to
+  Generic RX and their costs are joined with " / ".
 """
 from __future__ import annotations
 import re
@@ -101,6 +101,43 @@ def vlm_field_names(field_names: list[str]) -> list[str]:
 
 # ── Label-based tier mapping ──────────────────────────────────────────────────
 
+def _normalize_tier_label(label: str) -> str:
+    """Lowercase, collapse whitespace, normalize common carrier typos."""
+    n = re.sub(r'\s+', ' ', label.lower().strip())
+    n = n.replace('speciality', 'specialty')
+    n = n.replace('preffered', 'preferred')
+    # Canonicalize non-preferred variants: nonpreferred / non preferred / non-preffered
+    n = re.sub(r'\bnon[\s-]*pref+erred\b', 'non preferred', n)
+    n = re.sub(r'\s+drugs?$', '', n).strip()
+    n = re.sub(r'^all\s+other\s+', '', n).strip()
+    n = re.sub(r'\s*\(tier\s*\d+\)\s*', ' ', n).strip()
+    return re.sub(r'\s{2,}', ' ', n)
+
+
+def _is_generic_label(label: str) -> bool:
+    n = _normalize_tier_label(label)
+    return 'generic' in n and 'brand' not in n
+
+
+def _is_preferred_tier_label(label: str) -> bool:
+    n = _normalize_tier_label(label)
+    return bool(re.search(r'\bpreferred\b', n)) and not re.search(r'\bnon\s+preferred\b', n)
+
+
+def _is_non_preferred_tier_label(label: str) -> bool:
+    return bool(re.search(r'\bnon\s+preferred\b', _normalize_tier_label(label)))
+
+
+def _should_merge_duplicate_tier(label: str, tier_idx: int, prev_label: str) -> bool:
+    """Merge only when Generic is split into separate Preferred + Non-Preferred rows."""
+    if tier_idx != 0 or not _is_generic_label(label) or not _is_generic_label(prev_label):
+        return False
+    return (
+        (_is_preferred_tier_label(label) and _is_non_preferred_tier_label(prev_label))
+        or (_is_non_preferred_tier_label(label) and _is_preferred_tier_label(prev_label))
+    )
+
+
 def _label_to_tier_index(label: str) -> int | None:
     """Map a drug tier label string to a 0-based tier index.
 
@@ -117,16 +154,7 @@ def _label_to_tier_index(label: str) -> int | None:
     generic 'brand' check.
     """
     # Normalize: lowercase, collapse whitespace
-    n = re.sub(r'\s+', ' ', label.lower().strip())
-    # Strip "drugs" suffix ("Generic Drugs" → "Generic")
-    n = re.sub(r'\s+drugs?$', '', n).strip()
-    # Strip "all other" prefix ("All Other Generic" → "Generic") — sub-row qualifier
-    n = re.sub(r'^all\s+other\s+', '', n).strip()
-    # Strip bare parenthetical tier numbers "(tier N)" — they carry no semantic info
-    # beyond what the label text already says, e.g. "Tier 1 (Generic)" → "tier 1 generic"
-    # Leave "(preferred)" / "(non-preferred)" etc. since they carry meaning.
-    n = re.sub(r'\s*\(tier\s*\d+\)\s*', ' ', n).strip()
-    n = re.sub(r'\s{2,}', ' ', n)
+    n = _normalize_tier_label(label)
 
     # ── Exclude preventive sub-tier labels → skip ────────────────────────────
     # "Preventive" drugs are a special $0 sub-category within a tier (e.g.,
@@ -136,21 +164,23 @@ def _label_to_tier_index(label: str) -> int | None:
         return None
 
     # ── Priority 1: Non-Preferred Brand → ALWAYS Tier 3 ──────────────────────
-    # Catches: "Non-Preferred Brand", "Non-Preferred Brand Drugs",
-    #          "Tier 2 (Non-Preferred Brand)", "Non Preferred Brand"
-    if re.search(r'non.preferred\s+brand', n):
+    # Catches: "Non-Preferred Brand", "Brand Drugs (Non-Preferred)", "Brand (non-preferred)"
+    if re.search(r'non\s+preferred\s+brand', n) or (
+        re.search(r'\bbrand\b', n) and re.search(r'\bnon\s+preferred\b', n)
+    ):
         return 2
 
-    # ── Priority 2: Non-Preferred Generic → Tier 2 ───────────────────────────
-    # Occurs in plans that split generics into Preferred/Non-Preferred.
-    # Must be checked before the generic catch-all below.
-    if re.search(r'non.preferred\s+generic', n):
-        return 1
+    # ── Priority 2: Non-Preferred Generic → Generic RX (merge with Preferred) ─
+    # Catches: "Non-Preferred Generic", "Generic Drugs (Non-Preferred)"
+    if re.search(r'non\s+preferred\s+generic', n) or (
+        re.search(r'\bgeneric\b', n) and re.search(r'\bnon\s+preferred\b', n)
+    ):
+        return 0
 
     # ── Priority 3: Non-Preferred Specialty → Tier 5 ─────────────────────────
-    # Catches: "Non-Preferred Specialty", "Specialty (Non-Preferred)"
-    if re.search(r'non.preferred\s+specialty', n) or (
-        'specialty' in n and re.search(r'non.preferred', n)
+    # Catches: "Non-Preferred Specialty", "Specialty (Non-Preferred)", "Speciality (non-preferred)"
+    if re.search(r'non\s+preferred\s+specialty', n) or (
+        'specialty' in n and re.search(r'\bnon\s+preferred\b', n)
     ):
         return 4
 
@@ -258,6 +288,17 @@ def _is_preventive(label: str) -> bool:
 
 def _join_tier_value(current: str, addition: str) -> str:
     return addition if not current else current + " / " + addition
+
+
+def _merge_split_tier_value(current: str, addition: str) -> str:
+    """Join preferred + non-preferred rows; collapse when costs are identical."""
+    if not addition:
+        return current
+    if not current:
+        return addition
+    if current.strip() == addition.strip():
+        return current
+    return current + " / " + addition
 
 
 # Parenthetical channel markers — carriers use many synonyms.
@@ -468,18 +509,27 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
     # '10% coinsurance up to $250 / prescription'), NOT a tier separator.
     if "\n" in consolidated:
         result_nl: dict[int, str] = {}
+        labels_nl: dict[int, str] = {}
         for line in consolidated.splitlines():
             line = line.strip()
             if not line or ": " not in line or not line[0].isalpha():
                 continue
             label, _, value = line.partition(": ")
-            tier_idx = _label_to_tier_index(label.strip())
-            if tier_idx is not None and tier_idx not in result_nl and value.strip():
-                result_nl[tier_idx] = value.strip()
+            label = label.strip()
+            tier_idx = _label_to_tier_index(label)
+            if tier_idx is not None:
+                if tier_idx not in result_nl:
+                    result_nl[tier_idx] = value.strip()
+                    labels_nl[tier_idx] = label
+                elif _should_merge_duplicate_tier(label, tier_idx, labels_nl[tier_idx]):
+                    result_nl[tier_idx] = _merge_split_tier_value(
+                        result_nl[tier_idx], value.strip(),
+                    )
         return result_nl
 
     normalized = _TIER_SEMICOLON.sub(" / ", consolidated)
     result: dict[int, str] = {}
+    tier_labels: dict[int, str] = {}
     last_mapped_idx: int | None = None  # most recent successfully mapped tier index
     subrow_mode = False                 # last mapped tier has program sub-rows
 
@@ -503,12 +553,17 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
                         result[tier_idx] = ""   # anchored; awaiting non-preventive sub-rows
                     else:
                         result[tier_idx] = cost if nested else value
+                    tier_labels[tier_idx] = label
                     last_mapped_idx = tier_idx
                     subrow_mode = nested
                 elif subrow_mode and last_mapped_idx == tier_idx:
                     # Sub-row re-using the tier label (e.g. 'All Other Generic: $20')
                     if not (nested and _is_preventive(sub)):
                         result[tier_idx] = _join_tier_value(result[tier_idx], cost)
+                elif _should_merge_duplicate_tier(label, tier_idx, tier_labels[tier_idx]):
+                    addition = cost if nested else value
+                    result[tier_idx] = _merge_split_tier_value(result[tier_idx], addition)
+                    last_mapped_idx = tier_idx
                 else:
                     # Duplicate label outside sub-row mode — first match wins
                     last_mapped_idx = None
