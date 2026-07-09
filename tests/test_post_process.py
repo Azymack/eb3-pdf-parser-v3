@@ -512,6 +512,20 @@ class TestSixTierPreferredNonPreferredSplit:
             "Retail - Preferred Participating - 10% Coinsurance Participating - 20% coinsurance"
         )
 
+    def test_plain_labels_with_preferred_context(self):
+        """When preferred rows exist, plain Brand/Specialty rows represent non-preferred."""
+        s = (
+            "Preferred Generic: $10 / Generic: $35 / "
+            "Preferred Brand: 25% Coinsurance / Brand: 50% Coinsurance / "
+            "Preferred Specialty: 20% Coinsurance / Specialty: 50% Coinsurance"
+        )
+        tv = _extract_tier_values(s)
+        assert tv[0] == "$10 / $35"
+        assert tv[1] == "25% Coinsurance"
+        assert tv[2] == "50% Coinsurance"
+        assert tv[3] == "20% Coinsurance"
+        assert tv[4] == "50% Coinsurance"
+
 
 class TestChannelSplitting:
     """Unified retail / mail-order channel splitting for all network columns."""

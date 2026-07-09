@@ -128,6 +128,35 @@ def _is_non_preferred_tier_label(label: str) -> bool:
     return bool(re.search(r'\bnon\s+preferred\b', _normalize_tier_label(label)))
 
 
+def _is_plain_tier_label(label: str, kind: str) -> bool:
+    """Label contains kind but neither preferred nor non-preferred qualifier."""
+    n = _normalize_tier_label(label)
+    return (
+        kind in n
+        and not re.search(r'\bpreferred\b', n)
+        and not re.search(r'\bnon\s+preferred\b', n)
+    )
+
+
+def _contextual_tier_index(label: str, tier_idx: int | None, context_text: str) -> int | None:
+    """Refine ambiguous plain labels when preferred counterparts exist in same RX block."""
+    if tier_idx is None:
+        return None
+    if (
+        _is_plain_tier_label(label, "brand")
+        and "preferred brand" in context_text
+        and "non preferred brand" not in context_text
+    ):
+        return 2  # plain Brand means non-preferred Brand when Preferred Brand row exists
+    if (
+        _is_plain_tier_label(label, "specialty")
+        and "preferred specialty" in context_text
+        and "non preferred specialty" not in context_text
+    ):
+        return 4  # plain Specialty means non-preferred Specialty when Preferred row exists
+    return tier_idx
+
+
 def _should_merge_duplicate_tier(label: str, tier_idx: int, prev_label: str) -> bool:
     """Merge only when Generic is split into separate Preferred + Non-Preferred rows."""
     if tier_idx != 0 or not _is_generic_label(label) or not _is_generic_label(prev_label):
@@ -135,6 +164,8 @@ def _should_merge_duplicate_tier(label: str, tier_idx: int, prev_label: str) -> 
     return (
         (_is_preferred_tier_label(label) and _is_non_preferred_tier_label(prev_label))
         or (_is_non_preferred_tier_label(label) and _is_preferred_tier_label(prev_label))
+        or (_is_plain_tier_label(label, "generic") and _is_preferred_tier_label(prev_label))
+        or (_is_preferred_tier_label(label) and _is_plain_tier_label(prev_label, "generic"))
     )
 
 
@@ -503,6 +534,7 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
     """
     if not consolidated:
         return {}
+    context_text = _normalize_tier_label(consolidated)
 
     # Newline-separated output: each line is one complete tier entry and its
     # value is kept whole — ' / ' inside a line is part of the value (e.g.
@@ -516,7 +548,11 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
                 continue
             label, _, value = line.partition(": ")
             label = label.strip()
-            tier_idx = _label_to_tier_index(label)
+            tier_idx = _contextual_tier_index(
+                label,
+                _label_to_tier_index(label),
+                context_text,
+            )
             if tier_idx is not None:
                 if tier_idx not in result_nl:
                     result_nl[tier_idx] = value.strip()
@@ -544,7 +580,11 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
             value = value.strip()
             if not label:
                 continue
-            tier_idx = _label_to_tier_index(label)
+            tier_idx = _contextual_tier_index(
+                label,
+                _label_to_tier_index(label),
+                context_text,
+            )
             if tier_idx is not None:
                 sub, cost = _split_sublabel(value)
                 nested = sub is not None
