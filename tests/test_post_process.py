@@ -697,6 +697,33 @@ class TestApplyPostProcessingLabelBased:
             "$50 / 50% coinsurance with a $300 copay maximum / 50% coinsurance"
         )
 
+    def test_aetna_flat_oon_broadcast_1781127953(self):
+        """Aetna POS — VLM collapses repeated OON column to one unlabeled coinsurance."""
+        inn = (
+            "Tier 1A (Preferred Generic): $3 (retail) / Tier 1 (Preferred Generic): $10 (retail) / "
+            "Tier 2 (Preferred Brand): $45 (retail) / Tier 3 (Non-preferred Generic/Brand): $75 (retail) / "
+            "Specialty Drugs: Preferred: 20% coinsurance for up to a 30 day supply; "
+            "Non-preferred: 40% coinsurance for up to a 30 day supply"
+        )
+        oon_labeled = (
+            "Generic: 50% coinsurance deductible does not apply / "
+            "Brand: 50% coinsurance deductible does not apply / "
+            "Tier 3: 50% coinsurance deductible does not apply"
+        )
+        oon_flat = "50% coinsurance (retail), deductible does not apply"
+        base = {"Network Type": "POS", "In-Network RX": inn}
+
+        labeled = apply_post_processing({**base, "Out-of-Network RX": oon_labeled}, CATEGORY_FIELDS["health"])
+        assert labeled["Out-of-Network Generic RX"] == "50% coinsurance deductible does not apply"
+        assert labeled["Out-of-Network Brand RX"] == "50% coinsurance deductible does not apply"
+        assert labeled["Out-of-Network Tier 3 RX"] == "50% coinsurance deductible does not apply"
+
+        flat = apply_post_processing({**base, "Out-of-Network RX": oon_flat}, CATEGORY_FIELDS["health"])
+        assert flat["Out-of-Network Generic RX"] == "50% coinsurance"
+        assert flat["Out-of-Network Brand RX"] == "50% coinsurance"
+        assert flat["Out-of-Network Tier 3 RX"] == "50% coinsurance"
+        assert flat["Out-of-Network Tier 4 RX"] == "Not covered"
+
     def test_premera_comma_separated_rows_1773085355(self):
         """Premera AWB — simple 4-row table comma-separated on one line."""
         inn = (

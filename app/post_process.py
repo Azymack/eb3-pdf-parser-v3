@@ -933,7 +933,13 @@ def _extract_retail_only(value: str) -> str:
     if m:
         return m.group(1).strip()
     # Lone qualifiers — strip marker, keep cost
-    cleaned = re.sub(r'\s*\(\s*retail\s+only\s*\)', '', value, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(
+        r"\s*\(\s*retail\s*\)\s*,?\s*deductible does not apply\s*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned = re.sub(r'\s*\(\s*retail\s+only\s*\)', '', cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r'\s*/\s*prescription\s*\(\s*retail\s*\)\s*$', '', cleaned, flags=re.I).strip()
     cleaned = re.sub(r'\s*\(\s*retail\s*\)\s*$', '', cleaned, flags=re.IGNORECASE).strip(" ,")
     return cleaned
@@ -1321,6 +1327,61 @@ def _inn_has_six_row_pref_nonpref(inn_rx: str) -> bool:
     )
 
 
+def _looks_like_pharmacy_cost(value: str) -> bool:
+    """True when value looks like a drug cost, not a bare network label."""
+    v = value.strip().lower()
+    if not v or v in _NOT_COVERED_PHRASES:
+        return False
+    return bool(re.search(r"[\$%]|coinsurance|copay", v))
+
+
+def _is_unlabeled_flat_oon_pharmacy(oon_rx: str) -> bool:
+    """OON pharmacy string with a cost but no mappable tier labels."""
+    if not oon_rx or not _looks_like_pharmacy_cost(oon_rx):
+        return False
+    if _extract_tier_values(oon_rx):
+        return False
+    if re.search(
+        r"\b(?:generic|brand|tier\s*\d|preferred|non[-\s]+preferred|specialty)\s*:",
+        oon_rx,
+        re.I,
+    ):
+        return False
+    return True
+
+
+def _broadcast_flat_oon_pharmacy(
+    oon_rx: str,
+    inn_tier_values: dict[int, str],
+    inn_rx: str,
+) -> dict[int, str]:
+    """Apply one OON retail rate to Generic/Brand/Tier 3 when VLM omits row labels.
+
+    Aetna-style SBCs show the same Out-of-Network cell (e.g. '50% coinsurance (retail)')
+    on Preferred generic, Preferred brand, and Non-preferred rows. The VLM often outputs
+    that once without labels; broadcast to INN tier slots 0–2. When INN has a specialty
+    tier and OON omits it, specialty is usually 'Not covered' on these layouts.
+    """
+    if not _is_unlabeled_flat_oon_pharmacy(oon_rx) or not inn_tier_values:
+        return {}
+    val = _strip_rx_suffix(_normalize_tier_retail_value(oon_rx))
+    if not val:
+        return {}
+    out: dict[int, str] = {}
+    for idx in (0, 1, 2):
+        if idx in inn_tier_values and inn_tier_values[idx]:
+            out[idx] = val
+    inn_ctx = _normalize_tier_label(inn_rx)
+    if re.search(r"\bspecialty\b", inn_ctx) and not re.search(r"\bspecialty\b", oon_rx, re.I):
+        spec_idx = max((i for i in inn_tier_values if i >= 3), default=None)
+        if spec_idx is not None:
+            if re.search(r"\bnot\s+covered\b", oon_rx, re.I):
+                out[spec_idx] = "Not covered"
+            elif len(out) >= 1:
+                out[spec_idx] = "Not covered"
+    return out
+
+
 def _fix_oon_tier3_brand_split(
     tier_values: dict[int, str],
     oon_rx: str,
@@ -1467,6 +1528,16 @@ def apply_post_processing(
                 consolidated,
                 result.get("In-Network RX") or "",
             )
+            if not any(tier_values.get(i) for i in range(5)):
+                inn_tiers, _ = _extract_tier_values_with_mail(
+                    result.get("In-Network RX") or "",
+                    split_retail_mail_pairs=False,
+                )
+                tier_values = _broadcast_flat_oon_pharmacy(
+                    consolidated,
+                    inn_tiers,
+                    result.get("In-Network RX") or "",
+                )
         for i, suffix in enumerate(_TIER_SUFFIXES):
             field_name = f"{net_prefix} {suffix}"
             if field_name in output_field_names:
