@@ -155,6 +155,24 @@ class TestSplitRetailMail:
         assert _extract_retail_only(cell) == "$10"
         assert _extract_home_delivery(cell) == "$20"
 
+    def test_uhc_colon_channel_coinsurance_cell(self):
+        cell = (
+            "Retail: 50% coinsurance with a $150 copay maximum, deductible does not apply / "
+            "Mail-Order: 50% coinsurance with a $300 copay maximum, deductible does not apply / "
+            "Specialty Drugs: 50% coinsurance with a $150 copay maximum, deductible does not apply"
+        )
+        r, m = _split_retail_mail(cell)
+        assert r == "50% coinsurance with a $150 copay maximum, deductible does not apply"
+        assert m == "50% coinsurance with a $300 copay maximum, deductible does not apply"
+
+    def test_uhc_comma_channel_cell(self):
+        cell = "$25 copay, Mail-Order: $50 copay, Specialty Drugs: $25"
+        r, m = _split_retail_mail(cell)
+        assert r == "$25 copay"
+        assert m == "$50 copay"
+        assert _extract_retail_only(cell) == "$25 copay"
+        assert _extract_home_delivery(cell) == "$50 copay"
+
     def test_bcbs_supply_generic_retail_and_mail(self):
         cell = (
             "$10 / retail supply or $20 / mail service supply for low-cost generic drugs; "
@@ -530,6 +548,253 @@ class TestApplyPostProcessingLabelBased:
         assert result["In-Network Tier 5 RX"] == "$10 / $150 / $350 / $500"
         assert result["In-Network Mail Order RX"] == "$25 / $87.50 / $175 / $375"
 
+    def test_uhc_1772736193_retail_mail_specialty(self):
+        """UHC HMO DW46 — Tier 1-4 with Retail/Mail/Specialty per cell (1772736193)."""
+        fields = {
+            "Network Type": "HMO",
+            "In-Network RX": (
+                "Tier 1 (Generic): Retail $10 copay / Mail-Order $20 copay / Specialty Drugs $10 copay / "
+                "Tier 2 (Midrange-Cost): Retail $40 copay / Mail-Order $80 copay / Specialty Drugs $40 copay / "
+                "Tier 3 (Midrange-Cost): Retail $75 copay / Mail-Order $150 copay / Specialty Drugs $100 copay / "
+                "Tier 4 (Additional High-Cost): Retail $125 copay / Mail-Order $250 copay / Specialty Drugs $150 copay"
+            ),
+            "In-Network Mail Order RX": "$20 copay / $80 copay / $150 copay / $250 copay",
+            "Out-of-Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "$10"
+        assert result["In-Network Brand RX"] == "$40"
+        assert result["In-Network Tier 3 RX"] == "$75"
+        assert result["In-Network Tier 4 RX"] == "$125"
+        assert result["In-Network Tier 5 RX"] == "$10 / $40 / $100 / $150"
+        assert result["In-Network Mail Order RX"] == "$20 / $80 / $150 / $250"
+
+    def test_uhc_boilerplate_only_tier_value_stripped(self):
+        """VLM mistake: 'Deductible does not apply' alone must not become Generic RX."""
+        fields = {
+            "Network Type": "HMO",
+            "In-Network RX": (
+                "Tier 1 (Generic): Deductible does not apply / "
+                "Tier 2 (Midrange-Cost): Retail: $40 copay / "
+                "Tier 3 (Midrange-Cost): Retail: $75 copay / "
+                "Tier 4 (Additional High-Cost): Retail: $125 copay"
+            ),
+            "Out-of-Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == ""
+        assert result["In-Network Brand RX"] == "$40"
+        assert result["In-Network Tier 3 RX"] == "$75"
+
+    def test_uhc_live_vlm_string_1772736193(self):
+        """UHC HMO — live VLM with boilerplate prefix and Specialty Drugs** footnotes."""
+        inn = (
+            "Tier 1 (Generic): Deductible does not apply. Retail: $10 copay / Mail-Order: $20 copay / "
+            "Specialty Drugs**: $10 copay / Tier 2 (Midrange-Cost): Retail: $40 copay / Mail-Order: $80 copay / "
+            "Specialty Drugs**: $40 copay / Tier 3 (Midrange-Cost): Retail: $75 copay / Mail-Order: $150 copay / "
+            "Specialty Drugs**: $100 copay / Tier 4 (Additional High-Cost): Retail: $125 copay / "
+            "Mail-Order: $250 copay / Specialty Drugs**: $150 copay"
+        )
+        result = apply_post_processing(
+            {
+                "Network Type": "HMO",
+                "In-Network RX": inn,
+                "In-Network Mail Order RX": "$20 / $80 / $150 / $250",
+            },
+            CATEGORY_FIELDS["health"],
+        )
+        assert result["In-Network Generic RX"] == "$10"
+        assert result["In-Network Brand RX"] == "$40"
+        assert result["In-Network Tier 3 RX"] == "$75"
+        assert result["In-Network Tier 4 RX"] == "$125"
+        assert result["In-Network Tier 5 RX"] == "$10 / $40 / $100 / $150"
+
+    def test_bcbs_generic_drugs_label_format(self):
+        """BCBS VLM may label rows 'Generic drugs (Preferred)' — must not merge all rows."""
+        inn = (
+            "Generic drugs (Preferred): Retail: Preferred - No Charge Participating - $10/prescription / "
+            "Generic drugs (Non-Preferred): Retail: Preferred - $10/prescription Participating - $20/prescription / "
+            "Brand drugs (Preferred): Retail: Preferred - $50/prescription Participating - $70/prescription / "
+            "Brand drugs (Non-Preferred): Retail: Preferred - $100/prescription Participating - $120/prescription / "
+            "Specialty drugs (Preferred): $250/prescription / Specialty drugs (Non-Preferred): $350/prescription"
+        )
+        result = apply_post_processing(
+            {"Network Type": "PPO", "In-Network RX": inn},
+            CATEGORY_FIELDS["health"],
+        )
+        assert result["In-Network Generic RX"] == "No Charge / $10 / $20"
+        assert result["In-Network Brand RX"] == "$50 / $70"
+        assert result["In-Network Tier 3 RX"] == "$100 / $120"
+
+    def test_uhc_colon_labeled_tier_cells_1772746611(self):
+        """UHC NJ SBC — Retail:/Mail-Order:/Specialty Drugs: labels with coinsurance."""
+        fields = {
+            "Network Type": "EPO",
+            "In-Network RX": (
+                "Tier 1: Retail: $25 copay, deductible does not apply / "
+                "Mail-Order: $50 copay, deductible does not apply / "
+                "Specialty Drugs: $25 copay, deductible does not apply / "
+                "Tier 2: Retail: 50% coinsurance with a $150 copay maximum, deductible does not apply / "
+                "Mail-Order: 50% coinsurance with a $300 copay maximum, deductible does not apply / "
+                "Specialty Drugs: 50% coinsurance with a $150 copay maximum, deductible does not apply / "
+                "Tier 3: Retail: 50% coinsurance, deductible does not apply / "
+                "Mail-Order: 50% coinsurance, deductible does not apply / "
+                "Specialty Drugs: 50% coinsurance with a $150 copay maximum, deductible does not apply / "
+                "Tier 4: Not Applicable"
+            ),
+            "In-Network Mail Order RX": "$50 / $300 / $150",
+            "Out-of-Network RX": "",
+            "Preferred Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "$25 copay, deductible does not apply"
+        assert result["In-Network Brand RX"] == (
+            "50% coinsurance with a $150 copay maximum, deductible does not apply"
+        )
+        assert result["In-Network Tier 3 RX"] == "50% coinsurance, deductible does not apply"
+        assert result["In-Network Tier 5 RX"] == (
+            "$25 copay, deductible does not apply / "
+            "50% coinsurance with a $150 copay maximum, deductible does not apply / "
+            "50% coinsurance with a $150 copay maximum, deductible does not apply"
+        )
+        assert result["In-Network Mail Order RX"] == (
+            "$50 copay, deductible does not apply / "
+            "50% coinsurance with a $300 copay maximum, deductible does not apply / "
+            "50% coinsurance, deductible does not apply"
+        )
+
+    def test_uhc_comma_separated_channels_1772746611(self):
+        """VLM comma format: '$25 copay, Mail-Order: $50 copay, Specialty Drugs: $25'."""
+        fields = {
+            "Network Type": "EPO",
+            "In-Network RX": (
+                "Tier 1: $25 copay, Mail-Order: $50 copay, Specialty Drugs: $25 / "
+                "Tier 2: 50% coinsurance with a $150 copay maximum, "
+                "Mail-Order: 50% coinsurance with a $300 copay maximum, "
+                "Specialty Drugs: 50% coinsurance with a $150 copay maximum / "
+                "Tier 3: 50% coinsurance, Mail-Order: 50% coinsurance, "
+                "Specialty Drugs: 50% coinsurance with a $150 copay maximum / "
+                "Tier 4: Not Applicable"
+            ),
+            "In-Network Mail Order RX": (
+                "$50 copay, Specialty Drugs: $25 / "
+                "50% coinsurance with a $300 copay maximum, Specialty Drugs: 50% coinsurance with a $150 copay maximum / "
+                "50% coinsurance, Specialty Drugs: 50% coinsurance with a $150 copay maximum"
+            ),
+            "Out-of-Network RX": "",
+            "Preferred Network RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "$25"
+        assert result["In-Network Brand RX"] == "50% coinsurance with a $150 copay maximum"
+        assert result["In-Network Tier 3 RX"] == "50% coinsurance"
+        assert result["In-Network Tier 4 RX"] == "Not Applicable"
+        assert result["In-Network Tier 5 RX"] == (
+            "$25 / 50% coinsurance with a $150 copay maximum / "
+            "50% coinsurance with a $150 copay maximum"
+        )
+        assert result["In-Network Mail Order RX"] == (
+            "$50 / 50% coinsurance with a $300 copay maximum / 50% coinsurance"
+        )
+
+    def test_bcbs_six_row_preferred_non_preferred_1772810659(self):
+        """BCBS OK MOBAP0105 — 6-row pref/non-pref, dual retail columns per row."""
+        inn = (
+            "Generic (Preferred): No Charge / Generic (Non-Preferred): $10 / $20 / "
+            "Brand (Preferred): $50 / $70 / Brand (Non-Preferred): $100 / $120 / "
+            "Specialty (Preferred): $250 / Specialty (Non-Preferred): $350"
+        )
+        oon = (
+            "Generic (Preferred): $10 / Generic (Non-Preferred): $20 / "
+            "Brand (Preferred): $70 / Brand (Non-Preferred): $120 / "
+            "Specialty (Preferred): $250 / Specialty (Non-Preferred): $350"
+        )
+        fields = {
+            "Network Type": "PPO",
+            "In-Network RX": inn,
+            "Preferred Network RX": inn,
+            "Out-of-Network RX": oon,
+            "In-Network Mail Order RX": "$0 / $10 / $20 / $70 / $120 / $250 / $350",
+            "Out-of-Network Mail Order RX": "$10 / $20 / $70 / $120 / $250 / $350",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "No Charge / $10 / $20"
+        assert result["In-Network Brand RX"] == "$50 / $70"
+        assert result["In-Network Tier 3 RX"] == "$100 / $120"
+        assert result["In-Network Tier 4 RX"] == "$250"
+        assert result["In-Network Tier 5 RX"] == "$350"
+        assert result["Out-of-Network Generic RX"] == "$10 / $20"
+        assert result["Out-of-Network Brand RX"] == "$70"
+        assert result["Out-of-Network Tier 3 RX"] == "$120"
+        assert result["In-Network Mail Order RX"] == ""
+        assert result["Out-of-Network Mail Order RX"] == ""
+
+    def test_bcbs_preferred_participating_format_1772810659(self):
+        """BCBS OK — PDF uses Preferred - / Participating - dual retail columns."""
+        inn = (
+            "Generic (Preferred): Preferred - No Charge Participating - $10/prescription / "
+            "Generic (Non-Preferred): Preferred - $10/prescription Participating - $20/prescription / "
+            "Brand (Preferred): Preferred - $50/prescription Participating - $70/prescription / "
+            "Brand (Non-Preferred): Preferred - $100/prescription Participating - $120/prescription / "
+            "Specialty (Preferred): $250/prescription / Specialty (Non-Preferred): $350/prescription"
+        )
+        oon = (
+            "Generic (Preferred): $10/prescription / Generic (Non-Preferred): $20/prescription / "
+            "Brand (Preferred): $70/prescription / Brand (Non-Preferred): $120/prescription / "
+            "Specialty (Preferred): $250/prescription / Specialty (Non-Preferred): $350/prescription"
+        )
+        fields = {
+            "Network Type": "PPO",
+            "In-Network RX": inn,
+            "Preferred Network RX": "",
+            "Out-of-Network RX": oon,
+            "In-Network Mail Order RX": "No Charge / $30 / $150 / $300",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["In-Network Generic RX"] == "No Charge / $10 / $20"
+        assert result["In-Network Brand RX"] == "$50 / $70"
+        assert result["In-Network Tier 3 RX"] == "$100 / $120"
+        assert result["Out-of-Network Tier 4 RX"] == "$250"
+        assert result["Out-of-Network Tier 5 RX"] == "$350"
+        assert result["In-Network Mail Order RX"] == "$30 / $150 / $300"
+
+    def test_oon_tier3_brand_continuation_split_1772810659(self):
+        """OON: VLM appends non-pref brand cost to Brand (Preferred) without label."""
+        inn = (
+            "Generic (Preferred): Preferred - No Charge Participating - $10/prescription / "
+            "Generic (Non-Preferred): Preferred - $10/prescription Participating - $20/prescription / "
+            "Brand (Preferred): Preferred - $50/prescription Participating - $70/prescription / "
+            "Brand (Non-Preferred): Preferred - $100/prescription Participating - $120/prescription / "
+            "Specialty (Preferred): $250/prescription / Specialty (Non-Preferred): $350/prescription"
+        )
+        oon = (
+            "Generic (Preferred): $10/prescription / Generic (Non-Preferred): $20/prescription / "
+            "Brand (Preferred): $70/prescription / $120/prescription / "
+            "Specialty (Preferred): $250/prescription / Specialty (Non-Preferred): $350/prescription"
+        )
+        fields = {
+            "Network Type": "PPO",
+            "In-Network RX": inn,
+            "Out-of-Network RX": oon,
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["Out-of-Network Brand RX"] == "$70"
+        assert result["Out-of-Network Tier 3 RX"] == "$120"
+
+    def test_oon_tier3_plain_brand_continuation_split(self):
+        """OON: plain Brand label with $70 / $120 continuation when INN is 6-row."""
+        inn = (
+            "Generic (Preferred): No Charge / Generic (Non-Preferred): $10 / $20 / "
+            "Brand (Preferred): $50 / $70 / Brand (Non-Preferred): $100 / $120"
+        )
+        oon = "Generic: $10/prescription / $20/prescription / Brand: $70/prescription / $120/prescription"
+        result = apply_post_processing(
+            {"Network Type": "PPO", "In-Network RX": inn, "Out-of-Network RX": oon},
+            CATEGORY_FIELDS["health"],
+        )
+        assert result["Out-of-Network Brand RX"] == "$70"
+        assert result["Out-of-Network Tier 3 RX"] == "$120"
+
     def test_non_preferred_brand_routes_to_tier3_not_brand(self):
         fields = {
             "Network Type": "PPO",
@@ -628,6 +893,17 @@ class TestMailOrderStrippedByPostProcessing:
         result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
         assert result["In-Network Mail Order RX"] == "$25 / $80"
 
+
+class TestSplitPreferredParticipating:
+    def test_bcbs_dual_column_cell(self):
+        from app.post_process import _split_preferred_participating_value
+        cell = (
+            "Preferred: Preferred - No Charge Participating - $10/prescription / "
+            "Non preferred: Preferred - $10/prescription Participating - $20/prescription"
+        )
+        assert _split_preferred_participating_value(cell) == (
+            "No Charge / $10/prescription / $10/prescription / $20/prescription"
+        )
 
 class TestSixTierPreferredNonPreferredSplit:
     """BCBS TX 1769090950 — 6-row preferred/non-preferred pharmacy table."""

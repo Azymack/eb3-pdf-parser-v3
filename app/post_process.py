@@ -388,94 +388,188 @@ def _strip_embedded_specialty_from_value(value: str) -> str:
     return " / ".join(parts)
 
 
-_UHC_RETAIL_MAIL = re.compile(r'^(Retail|Mail[\s-]*Order)\s+(\$.+)$', re.I)
-_UHC_SPECIALTY_INLINE = re.compile(r'^Specialty\s+Drugs?\s*:?\s*(\$.+)$', re.I)
+_UHC_CHANNEL_BOUNDARY = re.compile(
+    r"\s*/\s*(?=(?:Retail|Mail[\s-]*Order|Specialty\s+Drugs?)\s*\**\s*(?::|\$))",
+    re.I,
+)
+_UHC_CHANNEL_MARKER = re.compile(
+    r"(?:^|[,/]\s*)(Retail|Mail[\s-]*Order|Specialty\s+Drugs?)\s*\**\s*:\s*",
+    re.I,
+)
+_UHC_CHANNEL_SEG = re.compile(
+    r"^(?:.*?\s)?(Retail|Mail[\s-]*Order|Specialty\s+Drugs?)\s*\**\s*"
+    r"(?::\s*(.+)|\$\s*(.+))$",
+    re.I,
+)
+
+_BOILERPLATE_TIER_VALUE = re.compile(
+    r"^deductible\s+does\s+not\s+apply\.?$",
+    re.I,
+)
+
+
+def _value_has_uhc_channels(value: str) -> bool:
+    """UHC SBC cells: 'Retail: $25 / Mail-Order: $50' or '$25, Mail-Order: $50'."""
+    return bool(re.search(
+        r"(?:Retail|Mail[\s-]*Order|Specialty\s+Drugs?)\s*\**\s*(?::|\$)",
+        value, re.I,
+    ))
 
 
 def _has_uhc_channel_markers(value: str) -> bool:
-    """UHC SBC cells label channels as 'Retail $X / Mail-Order $Y / Specialty Drugs $Z'."""
-    for part in value.split(" / "):
-        p = part.strip()
-        if _UHC_RETAIL_MAIL.match(p) or _UHC_SPECIALTY_INLINE.match(p):
-            return True
-    return False
+    return _value_has_uhc_channels(value)
 
 
 def _buf_has_uhc_channel_cell(buf: list[str]) -> bool:
-    return _has_uhc_channel_markers(" / ".join(buf))
+    return _value_has_uhc_channels(" / ".join(buf))
+
+
+def _parse_uhc_multi_channel_cell(value: str) -> tuple[str, str | None, list[str]]:
+    """Split one tier cell into retail, mail-order, and specialty channel costs.
+
+    Handles slash-separated ('Retail: $25 / Mail-Order: $50') and comma-separated
+    ('$25 copay, Mail-Order: $50 copay, Specialty Drugs: $25') UHC SBC layouts.
+    """
+    value = value.strip()
+    if not value or not _value_has_uhc_channels(value):
+        return value, None, []
+
+    markers = list(_UHC_CHANNEL_MARKER.finditer(value))
+    if markers:
+        retail_parts: list[str] = []
+        mail_parts: list[str] = []
+        specialty_parts: list[str] = []
+        if markers[0].start() > 0:
+            leading = value[:markers[0].start()].strip(" ,.")
+            if leading and not _BOILERPLATE_TIER_VALUE.match(leading.rstrip(".")):
+                retail_parts.append(leading)
+        for i, m in enumerate(markers):
+            name = re.sub(r"[\s-]+", " ", m.group(1).lower()).strip()
+            chunk = value[m.end(): markers[i + 1].start() if i + 1 < len(markers) else len(value)]
+            chunk = chunk.strip(" ,/")
+            if not chunk:
+                continue
+            if name == "retail":
+                retail_parts.append(chunk)
+            elif name.startswith("mail"):
+                mail_parts.append(chunk)
+            elif name.startswith("specialty"):
+                specialty_parts.append(chunk)
+        retail = " / ".join(retail_parts)
+        mail = " / ".join(mail_parts) if mail_parts else None
+        return retail, mail, specialty_parts
+
+    return _parse_uhc_slash_channel_cell(value)
+
+
+def _parse_uhc_slash_channel_cell(value: str) -> tuple[str, str | None, list[str]]:
+    """Fallback: 'Retail $10 / Mail-Order $20 / Specialty Drugs $10' (no colons)."""
+    retail_parts: list[str] = []
+    mail_parts: list[str] = []
+    specialty_parts: list[str] = []
+    for part in _UHC_CHANNEL_BOUNDARY.split(value) if _UHC_CHANNEL_BOUNDARY.search(value) else [value]:
+        part = part.strip()
+        if not part:
+            continue
+        channel, cost = _match_uhc_channel_segment(part)
+        if channel == "retail":
+            retail_parts.append(cost)
+        elif channel == "mail":
+            mail_parts.append(cost)
+        elif channel == "specialty":
+            specialty_parts.append(cost)
+        elif not retail_parts and not mail_parts and not specialty_parts:
+            retail_parts.append(part)
+    retail = " / ".join(retail_parts) if retail_parts else value
+    mail = " / ".join(mail_parts) if mail_parts else None
+    return retail, mail, specialty_parts
+
+
+def _split_on_uhc_channel_segments(value: str) -> list[str]:
+    """Split a tier cell into channel segments for legacy callers."""
+    retail, mail, specialty = _parse_uhc_multi_channel_cell(value)
+    segments: list[str] = []
+    if retail:
+        segments.append(retail)
+    if mail:
+        segments.append(f"Mail-Order: {mail}")
+    for sp in specialty:
+        segments.append(f"Specialty Drugs: {sp}")
+    return segments or [value]
+
+
+def _match_uhc_channel_segment(segment: str) -> tuple[str | None, str]:
+    segment = segment.strip()
+    m = _UHC_CHANNEL_SEG.match(segment)
+    if not m:
+        return None, segment
+    name = re.sub(r'[\s-]+', ' ', m.group(1).lower()).strip()
+    cost = (m.group(2) or f"${m.group(3)}").strip()
+    if name.startswith("mail"):
+        return "mail", cost
+    if name.startswith("specialty"):
+        return "specialty", cost
+    return "retail", cost
 
 
 def _split_uhc_channel_segment(segment: str) -> tuple[str | None, str]:
-    segment = segment.strip()
-    m = _UHC_RETAIL_MAIL.match(segment)
-    if m:
-        channel = re.sub(r'[\s-]+', ' ', m.group(1).lower()).strip()
-        return channel, m.group(2).strip()
-    m = _UHC_SPECIALTY_INLINE.match(segment)
-    if m:
-        return "specialty drugs", m.group(1).strip()
-    return None, segment
+    return _match_uhc_channel_segment(segment)
 
 
 def _split_uhc_retail_mail(value: str) -> tuple[str, str | None]:
-    """UHC per-tier cell: 'Retail $10 / Mail-Order $20 / Specialty Drugs $10'."""
-    retail_parts: list[str] = []
-    mail_parts: list[str] = []
-    other_parts: list[str] = []
-    for part in value.split(" / "):
-        part = part.strip()
-        if not part:
-            continue
-        channel, cost = _split_uhc_channel_segment(part)
-        if channel == "retail":
-            retail_parts.append(cost)
-        elif channel and channel.startswith("mail"):
-            mail_parts.append(cost)
-        elif channel and channel.startswith("specialty"):
-            continue
-        else:
-            other_parts.append(part)
-    if retail_parts:
-        retail = " / ".join(retail_parts)
-    elif other_parts:
-        retail = " / ".join(other_parts)
-    else:
-        retail = value
-    mail = " / ".join(mail_parts) if mail_parts else None
-    return retail, mail
+    """UHC per-tier cell — retail and mail-order only (specialty handled separately)."""
+    retail, mail, _ = _parse_uhc_multi_channel_cell(value)
+    if _value_has_uhc_channels(value):
+        return retail, mail
+    return value, None
 
 
 def _strip_inline_specialty_words(value: str) -> tuple[str, list[str]]:
-    """Pull 'Specialty Drugs $X' channel segments out of a tier cell value."""
-    specialty_parts: list[str] = []
-    kept: list[str] = []
-    for part in value.split(" / "):
-        part = part.strip()
-        if not part:
-            continue
-        channel, cost = _split_uhc_channel_segment(part)
-        if channel and channel.startswith("specialty"):
-            if cost:
-                specialty_parts.append(cost)
-        else:
-            kept.append(part)
-    return " / ".join(kept), specialty_parts
+    """Pull Specialty Drugs channel segments out of a tier cell value."""
+    retail, _, specialty = _parse_uhc_multi_channel_cell(value)
+    if _value_has_uhc_channels(value):
+        return retail, specialty
+    return value, []
+
+
+def _segment_tier_drug_label(seg: str, context_text: str = "") -> str | None:
+    """Return label when segment starts a new mapped drug tier row."""
+    if ": " not in seg or not seg or not seg[0].isalpha():
+        return None
+    label = seg.partition(": ")[0].strip()
+    if _label_to_tier_index(label, context_text) is not None:
+        return label
+    return None
+
+
+def _normalize_uhc_specialty_seg(seg: str) -> str:
+    """PDF footnote markers: 'Specialty Drugs**: $10' -> 'Specialty Drugs: $10'."""
+    return re.sub(r"Specialty\s+Drugs?\s*\*+\s*:", "Specialty Drugs:", seg.strip(), flags=re.I)
+
+
+def _is_standalone_uhc_channel_segment(seg: str, context_text: str = "") -> bool:
+    """Retail/Mail-Order channel continuation — not a new tier or Specialty Drugs row."""
+    s = seg.strip()
+    if re.match(r"^Tier\s*\d+", s, re.I):
+        return False
+    if _segment_tier_drug_label(s, context_text):
+        return False
+    channel, _ = _match_uhc_channel_segment(s)
+    return channel in ("retail", "mail")
 
 
 def _is_inline_specialty_segment(seg: str, buf: list[str]) -> bool:
     """Single-tier Specialty Drugs cost inside a Retail/Mail-Order cell — not Tier 5 row."""
     if not buf or not _buf_has_uhc_channel_cell(buf):
         return False
-    seg = seg.strip()
-    m = _UHC_SPECIALTY_INLINE.match(seg)
-    if m:
+    seg = _normalize_uhc_specialty_seg(seg)
+    channel, cost = _match_uhc_channel_segment(seg)
+    if channel != "specialty":
+        m = re.match(r"^Specialty\s+Drugs?\s*:\s*(.+)$", seg, re.I)
+        if not m:
+            return False
         cost = m.group(1).strip()
-        return bool(cost) and not re.search(r'\s/\s+\$', cost)
-    m = re.match(r'^Specialty\s+Drugs?\s*:\s*(.+)$', seg, re.I)
-    if not m:
-        return False
-    cost = m.group(1).strip()
-    return bool(cost) and not re.search(r'\s/\s+\$', cost)
+    return bool(cost) and not re.search(r"\s/\s+\$", cost)
 
 
 def _apply_embedded_specialty_tier5(tier_values: dict[int, str]) -> dict[int, str]:
@@ -505,6 +599,24 @@ def _apply_embedded_specialty_tier5(tier_values: dict[int, str]) -> dict[int, st
     return result
 
 
+def _canon_tier_part(part: str) -> str:
+    """Normalize a slash-separated tier fragment for duplicate comparison."""
+    s = re.sub(r"\s*/?\s*(?:per\s+)?prescription\b", "", part.lower())
+    return re.sub(r"\s+", " ", s).strip(" ,.")
+
+
+def _dedupe_adjacent_tier_parts(value: str) -> str:
+    """Collapse consecutive duplicate values after Preferred/Participating splits."""
+    if not value:
+        return value
+    parts = [p.strip() for p in value.split(" / ") if p.strip()]
+    out: list[str] = []
+    for part in parts:
+        if not out or _canon_tier_part(part) != _canon_tier_part(out[-1]):
+            out.append(part)
+    return " / ".join(out)
+
+
 def _finalize_tier_value_dict(
     raw_tiers: dict[int, str],
     *,
@@ -514,9 +626,12 @@ def _finalize_tier_value_dict(
     result: dict[int, str] = {}
     for idx, val in raw_tiers.items():
         if idx <= 3:
-            result[idx] = _normalize_tier_retail_value(
+            normalized = _normalize_tier_retail_value(
                 val, split_retail_mail_pairs=split_retail_mail_pairs,
             )
+            if idx == 0:
+                normalized = _dedupe_adjacent_tier_parts(normalized)
+            result[idx] = normalized
         else:
             parts = [
                 _normalize_specialty_cost_fragment(part)
@@ -525,6 +640,23 @@ def _finalize_tier_value_dict(
             ]
             result[idx] = " / ".join(part for part in parts if part)
     return result
+
+
+def _preferred_rx_redundant_with_inn(preferred_rx: str, inn_rx: str) -> bool:
+    """True when Preferred Network RX duplicates a prefix of In-Network RX."""
+    p, i = preferred_rx.strip(), inn_rx.strip()
+    if not p:
+        return True
+    if p == i:
+        return True
+    if not i.startswith(p):
+        return False
+    rest = i[len(p):].lstrip()
+    if rest and not rest.startswith("/"):
+        return False
+    pref_tiers = _extract_tier_values(p)
+    inn_tiers = _extract_tier_values(i)
+    return all(inn_tiers.get(k) == v for k, v in pref_tiers.items())
 
 
 def _parse_retail_tier_values(
@@ -667,6 +799,9 @@ def _split_consolidated_tier_parts(consolidated: str) -> list[str]:
             buf = []
 
     for seg in segments:
+        if buf and _is_standalone_uhc_channel_segment(seg, context_text):
+            buf.append(seg)
+            continue
         if buf and _is_inline_specialty_segment(seg, buf):
             buf.append(seg)
             continue
@@ -821,10 +956,79 @@ def _split_unlabeled_retail_mail(value: str) -> tuple[str, str | None]:
     return value, None
 
 
+def _split_preferred_participating_value(value: str) -> str:
+    """BCBS SBC: 'Preferred - No Charge Participating - $10/prescription' -> 'No Charge / $10'."""
+    if not value or not re.search(r"\bPreferred\s*-", value, re.I):
+        return value
+    parts = [p.strip() for p in value.split(" / ") if p.strip()]
+    out: list[str] = []
+    for part in parts:
+        m = re.search(
+            r"Preferred\s*-\s*(.+?)\s+Participating\s*-\s*(.+)$",
+            part,
+            re.I,
+        )
+        if m:
+            out.append(f"{m.group(1).strip()} / {m.group(2).strip()}")
+        else:
+            out.append(part)
+    return " / ".join(out)
+
+
+def _collect_retail_canon_atoms(values: list[str]) -> set[str]:
+    """Canonical tokens from per-tier retail values for mail-order dedup."""
+    atoms: set[str] = set()
+    for val in values:
+        if not val:
+            continue
+        for part in val.split(" / "):
+            part = part.strip()
+            if not part:
+                continue
+            cp = re.sub(r"\s*/?\s*(?:per\s+)?prescription\b", "", part.lower())
+            cp = re.sub(r"\s+", " ", cp).strip(" ,.")
+            if cp:
+                atoms.add(cp)
+            for m in re.finditer(r"\$\d+(?:\.\d+)?", part):
+                atoms.add(m.group(0).lower())
+    return atoms
+
+
+def _should_drop_retail_echo_from_mail(part: str, retail_atoms: set[str]) -> bool:
+    """Drop mail-order parts that duplicate a retail per-tier value (VLM copy error)."""
+    part = part.strip()
+    if not part:
+        return True
+    cp = re.sub(r"\s*/?\s*(?:per\s+)?prescription\b", "", part.lower())
+    cp = re.sub(r"\s+", " ", cp).strip(" ,.")
+    if cp in ("no charge", "$0", "0"):
+        return True
+    if cp in retail_atoms:
+        return True
+    m = re.fullmatch(r"\$\d+(?:\.\d+)?", part)
+    if m and m.group(0).lower() in retail_atoms:
+        return True
+    return False
+
+
+def _strip_boilerplate_tier_value(value: str) -> str:
+    """Drop disclaimer-only tier values the VLM mistook for a cost (UHC Tier 1)."""
+    if not value:
+        return value
+    stripped = value.strip()
+    if not re.search(r"[\$%]", stripped) and _BOILERPLATE_TIER_VALUE.match(stripped):
+        return ""
+    return value
+
+
 def _normalize_tier_retail_value(value: str, *, split_retail_mail_pairs: bool = False) -> str:
     """Retail portion of a tier cell, channel markers removed and suffix stripped."""
     if not value:
         return value
+    value = _strip_boilerplate_tier_value(value)
+    if not value:
+        return value
+    value = _split_preferred_participating_value(value)
     retail, _ = _split_retail_mail(value)
     retail = _extract_retail_only(retail)
     if split_retail_mail_pairs:
@@ -1059,6 +1263,56 @@ def _strip_rx_suffix(value: str) -> str:
     return " / ".join(stripped)
 
 
+def _inn_has_six_row_pref_nonpref(inn_rx: str) -> bool:
+    """True when In-Network RX uses the BCBS 6-row Preferred/Non-Preferred pharmacy table."""
+    ctx = _normalize_tier_label(inn_rx)
+    if re.search(r"\btier\s*[1-4]\b", ctx) and not re.search(
+        r"generic\s*\(\s*preferred\s*\)", ctx
+    ):
+        return False
+    return all(
+        re.search(pat, ctx)
+        for pat in (
+            r"generic(?:\s+drugs?)?\s*\(\s*preferred\s*\)",
+            r"generic(?:\s+drugs?)?\s*\(\s*non\s+preferred\s*\)",
+            r"brand(?:\s+drugs?)?\s*\(\s*preferred\s*\)",
+            r"brand(?:\s+drugs?)?\s*\(\s*non\s+preferred\s*\)",
+        )
+    )
+
+
+def _fix_oon_tier3_brand_split(
+    tier_values: dict[int, str],
+    oon_rx: str,
+    inn_rx: str,
+) -> dict[int, str]:
+    """Move a second Brand value into Tier 3 for OON 6-row tables.
+
+    In-Network Brand RX often has two retail costs on Brand (Preferred) via
+    continuation ('$50 / $70').  On Out-of-Network the same continuation pattern
+    is '$70 / $120' where $70 is Brand (Preferred) and $120 is Brand
+    (Non-Preferred) — but the VLM may omit the Non-Preferred label and append
+    $120 to Brand (Preferred) instead.
+    """
+    if not _inn_has_six_row_pref_nonpref(inn_rx):
+        return tier_values
+    if tier_values.get(2):
+        return tier_values
+    oon_ctx = _normalize_tier_label(oon_rx)
+    if re.search(r"\bbrand\s*\(\s*non\s+preferred\s*\)", oon_ctx):
+        return tier_values
+    brand = tier_values.get(1, "")
+    if " / " not in brand:
+        return tier_values
+    parts = [p.strip() for p in brand.split(" / ") if p.strip()]
+    if len(parts) != 2:
+        return tier_values
+    out = dict(tier_values)
+    out[1] = parts[0]
+    out[2] = parts[1]
+    return out
+
+
 def _merge_preferred_and_inn_tier_values(
     preferred_rx: str, inn_rx: str
 ) -> dict[int, str]:
@@ -1155,44 +1409,44 @@ def apply_post_processing(
             and preferred_rx
             and not designated_tier_fields
         ):
-            tier_values = _merge_preferred_and_inn_tier_values(preferred_rx, consolidated)
+            if _preferred_rx_redundant_with_inn(preferred_rx, consolidated):
+                tier_values, _ = _extract_tier_values_with_mail(
+                    consolidated, split_retail_mail_pairs=split_pairs,
+                )
+            else:
+                tier_values = _merge_preferred_and_inn_tier_values(
+                    preferred_rx, consolidated,
+                )
         else:
             tier_values, _explicit_mail = _extract_tier_values_with_mail(
                 consolidated, split_retail_mail_pairs=split_pairs,
+            )
+        if net_prefix == "Out-of-Network":
+            tier_values = _fix_oon_tier3_brand_split(
+                tier_values,
+                consolidated,
+                result.get("In-Network RX") or "",
             )
         for i, suffix in enumerate(_TIER_SUFFIXES):
             field_name = f"{net_prefix} {suffix}"
             if field_name in output_field_names:
                 result[field_name] = tier_values.get(i, "")
 
-    # Pass 2b: drop retail coinsurance values the VLM copied into Mail Order.
-    # A mail-order part that verbatim-equals a retail per-tier value AND is a
-    # coinsurance expression is almost certainly a retail-only tier (typically
-    # Specialty, "Up to a 30-day supply (retail)") wrongly attributed to mail
-    # order — flat-dollar duplicates are left alone since 90-day mail prices
-    # can legitimately coincide with retail dollars.
-    def _canon(s: str) -> str:
-        s = re.sub(r'\s*/?\s*(?:per\s+)?prescription\b', '', s.lower())
-        return re.sub(r'\s+', ' ', s).strip(' ,.')
-
-    retail_tier_values = {
-        _canon(result.get(f"{np} {sfx}") or "")
+    # Pass 2b: drop retail values the VLM wrongly copied into Mail Order.
+    retail_field_values = [
+        result.get(f"{np} {sfx}") or ""
         for np in ("In-Network", "Out-of-Network", "Designated Network")
         for sfx in _TIER_SUFFIXES
-    } - {""}
+    ]
+    retail_atoms = _collect_retail_canon_atoms(retail_field_values)
     for mo_field in _MAIL_ORDER_RX_FIELDS:
-        # Designated mail order often legitimately repeats retail coinsurance rates
-        # for specialty tiers — skip the retail-dedup heuristic for that column.
         if mo_field == "Designated Network Mail Order RX":
             continue
         val = result.get(mo_field)
-        if isinstance(val, str) and val and retail_tier_values:
+        if isinstance(val, str) and val:
             kept = [
                 p for p in (part.strip() for part in val.split(" / "))
-                if p and _canon(p) and not (
-                    ("%" in p or "coinsurance" in p.lower())
-                    and _canon(p) in retail_tier_values
-                )
+                if p and not _should_drop_retail_echo_from_mail(p, retail_atoms)
             ]
             result[mo_field] = " / ".join(kept)
 
