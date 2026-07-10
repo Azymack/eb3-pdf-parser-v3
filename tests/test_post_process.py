@@ -1238,6 +1238,77 @@ class TestHealth3TierDesignatedTierFields:
         )
         assert result["Out-of-Network Generic RX"] == ""
 
+    def test_anthem_gold_select_1780511663(self):
+        """1780511663 — Anthem Typically (Tier N) rows; Brand RX + per-network mail."""
+        des = (
+            "Typically Generic (Tier 1): $10 (retail) / $20 (home delivery) / "
+            "Typically Preferred Brand & Non-Preferred Generic Drugs (Tier 2): $50 (retail) / $60 (home delivery) / "
+            "Typically Non-Preferred Brand and Generic drugs (Tier 3): $90 (retail) / $225 (home delivery) / "
+            "Typically Preferred Specialty (brand and generic) (Tier 4): 30% coinsurance up to $250 (retail and home delivery)"
+        )
+        inn = (
+            "Typically Generic (Tier 1): $20 (retail) / "
+            "Typically Preferred Brand & Non-Preferred Generic Drugs (Tier 2): $60 (retail) / "
+            "Typically Non-Preferred Brand and Generic drugs (Tier 3): $100 (retail) / "
+            "Typically Preferred Specialty (brand and generic) (Tier 4): 40% coinsurance up to $250 (retail)"
+        )
+        fields = {
+            "Network Type": "PPO",
+            "Designated Network RX": des,
+            "In-Network RX": inn,
+            "Out-of-Network RX": "Not covered",
+            "Designated Network Mail Order RX": "$20 / $60 / $225 / 30% coinsurance up to $250",
+            "In-Network Mail Order RX": "$20 / $60 / $100 / 40% coinsurance up to $250",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health_3tier"])
+        assert result["Designated Network Generic RX"] == "$10"
+        assert result["Designated Network Brand RX"] == "$50"
+        assert result["Designated Network Tier 3 RX"] == "$90"
+        assert result["Designated Network Tier 4 RX"] == "30% coinsurance up to $250"
+        assert result["In-Network Generic RX"] == "$20"
+        assert result["In-Network Brand RX"] == "$60"
+        assert result["In-Network Tier 3 RX"] == "$100"
+        assert result["In-Network Tier 4 RX"] == "40% coinsurance up to $250"
+        assert result["Designated Network Mail Order RX"] == (
+            "$20 / $60 / $225 / 30% coinsurance up to $250"
+        )
+        assert result["In-Network Mail Order RX"] == (
+            "$20 / $60 / $100 / 40% coinsurance up to $250"
+        )
+        assert result["Out-of-Network Generic RX"] == "Not covered"
+        assert result["Out-of-Network Mail Order RX"] == "Not covered"
+
+    def test_anthem_gold_select_1780511663_tier_prefix_labels(self):
+        """1780511663 live VLM — labels as 'Tier N (Typically X)' instead of trailing (Tier N)."""
+        des = (
+            "Tier 1 (Typically Generic): $10 (retail) / $20 (home delivery) / "
+            "Tier 2 (Typically Preferred Brand & Non-Preferred Generic Drugs): $50 (retail) / $60 (home delivery) / "
+            "Tier 3 (Typically Non-Preferred Brand and Generic drugs): $90 (retail) / $225 (home delivery) / "
+            "Tier 4 (Typically Preferred Specialty): 30% coinsurance up to $250 (retail and home delivery)"
+        )
+        inn = (
+            "Tier 1 (Typically Generic): $20 (retail) / "
+            "Tier 2 (Typically Preferred Brand & Non-Preferred Generic Drugs): $60 (retail) / "
+            "Tier 3 (Typically Non-Preferred Brand and Generic drugs): $100 (retail) / "
+            "Tier 4 (Typically Preferred Specialty): 40% coinsurance up to $250 (retail)"
+        )
+        fields = {
+            "Network Type": "PPO",
+            "Designated Network RX": des,
+            "In-Network RX": inn,
+            "Out-of-Network RX": "Not covered",
+            "Designated Network Mail Order RX": "$20 / $60 / $225 / 30% coinsurance up to $250",
+            "In-Network Mail Order RX": "$20 / $60 / $100 / 40% coinsurance up to $250",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health_3tier"])
+        assert result["Designated Network Brand RX"] == "$50"
+        assert result["Designated Network Tier 3 RX"] == "$90"
+        assert result["In-Network Brand RX"] == "$60"
+        assert result["In-Network Tier 3 RX"] == "$100"
+        assert result["In-Network Mail Order RX"] == (
+            "$20 / $60 / $100 / 40% coinsurance up to $250"
+        )
+
     def test_designated_does_not_merge_into_inn_per_tier(self):
         """When designated per-tier fields exist, In-Network per-tier uses In-Network RX only."""
         fields = {

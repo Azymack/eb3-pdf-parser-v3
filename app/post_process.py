@@ -222,6 +222,16 @@ def _label_to_tier_index(label: str, context_text: str = "") -> int | None:
     a label like "Non-Preferred Brand Drugs" doesn't accidentally match the
     generic 'brand' check.
     """
+    # Anthem "Typically X (Tier N)" and "Tier N (Typically X)" rows — the document's
+    # tier number is authoritative for these combined drug-class labels.
+    if re.match(r'typically\b', label, re.I):
+        m = re.search(r'\(\s*tier\s*([1-5])\s*\)', label, re.I)
+        if m:
+            return int(m.group(1)) - 1
+    m = re.match(r'tier\s*([1-5])\s*\(\s*typically\b', label, re.I)
+    if m:
+        return int(m.group(1)) - 1
+
     # Normalize: lowercase, collapse whitespace
     n = _normalize_tier_label(label)
 
@@ -317,6 +327,19 @@ def _label_to_tier_index(label: str, context_text: str = "") -> int | None:
         return int(m.group(1)) - 1
 
     return None  # unrecognized
+
+
+def _derived_mail_pollutes_retail(derived: str) -> bool:
+    return "(retail)" in derived.lower()
+
+
+def _should_prefer_existing_mail_order(existing: str, derived: str) -> bool:
+    """Keep VLM mail-only values when consolidated derivation mixes in retail costs."""
+    if not existing or not derived:
+        return False
+    if _derived_mail_pollutes_retail(derived) and not _derived_mail_pollutes_retail(existing):
+        return True
+    return False
 
 
 def _strip_tier_labels(value: str) -> str:
@@ -1570,22 +1593,24 @@ def apply_post_processing(
                 result[field_name] = tier_values.get(i, "")
 
     # Pass 2b: drop retail values the VLM wrongly copied into Mail Order.
-    retail_field_values = [
-        result.get(f"{np} {sfx}") or ""
-        for np in ("In-Network", "Out-of-Network", "Designated Network")
-        for sfx in _TIER_SUFFIXES
-    ]
-    retail_atoms = _collect_retail_canon_atoms(retail_field_values)
-    for mo_field in _MAIL_ORDER_RX_FIELDS:
-        if mo_field == "Designated Network Mail Order RX":
-            continue
-        val = result.get(mo_field)
-        if isinstance(val, str) and val:
-            kept = [
-                p for p in (part.strip() for part in val.split(" / "))
-                if p and not _should_drop_retail_echo_from_mail(p, retail_atoms)
-            ]
-            result[mo_field] = " / ".join(kept)
+    # health_3tier mail fields are separate VLM columns — do not dedupe against retail tiers.
+    if not designated_tier_fields:
+        retail_field_values = [
+            result.get(f"{np} {sfx}") or ""
+            for np in ("In-Network", "Out-of-Network", "Designated Network")
+            for sfx in _TIER_SUFFIXES
+        ]
+        retail_atoms = _collect_retail_canon_atoms(retail_field_values)
+        for mo_field in _MAIL_ORDER_RX_FIELDS:
+            if mo_field == "Designated Network Mail Order RX":
+                continue
+            val = result.get(mo_field)
+            if isinstance(val, str) and val:
+                kept = [
+                    p for p in (part.strip() for part in val.split(" / "))
+                    if p and not _should_drop_retail_echo_from_mail(p, retail_atoms)
+                ]
+                result[mo_field] = " / ".join(kept)
 
     # Pass 3: strip tier labels from Mail Order RX fields.
     # Mail Order fields display 90-day costs as "$20 / $80", not "Tier 1: $20 / Tier 2: $80".
@@ -1616,19 +1641,35 @@ def apply_post_processing(
             ],
         ]
     for net_prefix, consolidated, mo_field, split_pairs in mail_sources:
+        existing = result.get(mo_field) or ""
         derived = _build_mail_order_from_consolidated(
             consolidated, split_retail_mail_pairs=split_pairs,
         )
         if derived:
+            if (
+                existing
+                and designated_tier_fields
+                and net_prefix == "Designated Network"
+            ):
+                # VLM mail-only column is authoritative when present; consolidated
+                # derivation can miss specialty-tier mail or mix in retail costs.
+                continue
+            if _should_prefer_existing_mail_order(existing, derived):
+                continue
             result[mo_field] = derived
         elif designated_tier_fields and net_prefix != "Designated Network":
-            # health_3tier INN/OON columns with no embedded mail → no mail benefit.
-            # Clears VLM mail wrongly copied from the Designated column.
-            if not (
+            # health_3tier INN/OON: clear only empty fields or mail copied from Designated.
+            designated_mo = result.get("Designated Network Mail Order RX") or ""
+            if not existing:
+                result[mo_field] = ""
+            elif existing.strip() == designated_mo.strip():
+                result[mo_field] = ""
+            elif (
                 oon_pharmacy_not_covered
                 and mo_field == "Out-of-Network Mail Order RX"
             ):
-                result[mo_field] = ""
+                pass
+            # else keep valid network-specific VLM mail order values
 
     if oon_pharmacy_not_covered:
         if (
