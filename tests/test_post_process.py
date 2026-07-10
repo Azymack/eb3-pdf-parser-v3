@@ -697,6 +697,38 @@ class TestApplyPostProcessingLabelBased:
             "$50 / 50% coinsurance with a $300 copay maximum / 50% coinsurance"
         )
 
+    def test_premera_comma_separated_rows_1773085355(self):
+        """Premera AWB — simple 4-row table comma-separated on one line."""
+        inn = (
+            "Generic drugs: $20 copay/prescription (retail), Preferred brand drugs: "
+            "$35 copay/prescription (retail), Non-preferred brand drugs: "
+            "$55 copay/prescription (retail), Specialty drugs: $150 copay/prescription"
+        )
+        oon = (
+            "Generic drugs: $20 copay/prescription + 40% coinsurance (retail), "
+            "Preferred brand drugs: $35 copay/prescription + 40% coinsurance (retail), "
+            "Non-preferred brand drugs: $55 copay/prescription + 40% coinsurance (retail), "
+            "Specialty drugs: Not covered"
+        )
+        result = apply_post_processing(
+            {
+                "Network Type": "PPO",
+                "In-Network RX": inn,
+                "In-Network Mail Order RX": "$60 / $105 / $165",
+                "Out-of-Network RX": oon,
+            },
+            CATEGORY_FIELDS["health"],
+        )
+        assert result["In-Network Generic RX"] == "$20"
+        assert result["In-Network Brand RX"] == "$35"
+        assert result["In-Network Tier 3 RX"] == "$55"
+        assert result["In-Network Tier 4 RX"] == "$150"
+        assert result["In-Network Mail Order RX"] == "$60 / $105 / $165"
+        assert result["Out-of-Network Generic RX"] == "$20 copay/prescription + 40% coinsurance"
+        assert result["Out-of-Network Brand RX"] == "$35 copay/prescription + 40% coinsurance"
+        assert result["Out-of-Network Tier 3 RX"] == "$55 copay/prescription + 40% coinsurance"
+        assert result["Out-of-Network Tier 4 RX"] == "Not covered"
+
     def test_bcbs_six_row_preferred_non_preferred_1772810659(self):
         """BCBS OK MOBAP0105 — 6-row pref/non-pref, dual retail columns per row."""
         inn = (

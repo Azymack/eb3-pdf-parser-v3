@@ -49,6 +49,17 @@ import re
 # or "; maintenance drugs only): " (no colon-space after the label word).
 _TIER_SEMICOLON = re.compile(r';\s+(?=[A-Za-z][^;:/]+:\s)')
 
+# Comma between drug ROW labels (Premera-style): "Generic drugs: $20, Preferred brand drugs: $35"
+# Does NOT match UHC in-cell channels: "..., Mail-Order: $50" or "Tier 1: ..., Specialty Drugs: $25"
+_TIER_COMMA_BOUNDARY = re.compile(
+    r',\s+(?='
+    r'(?:Generic\s+drugs?|Preferred\s+brand(?:\s+drugs?)?|'
+    r'Non[-\s]+preferred\s+brand(?:\s+drugs?)?|Specialty\s+drugs?)'
+    r'\s*:'
+    r')',
+    re.I,
+)
+
 _COMPUTED_TIER_FIELDS: frozenset[str] = frozenset({
     "Designated Network Generic RX", "Designated Network Brand RX",
     "Designated Network Tier 3 RX", "Designated Network Tier 4 RX",
@@ -780,11 +791,34 @@ def _is_not_covered_mail_fragment(value: str) -> bool:
     return value.strip().lower() in _NOT_COVERED_PHRASES
 
 
+def _should_normalize_comma_tier_separators(consolidated: str) -> bool:
+    """True for simple multi-row drug tables comma-separated on one line."""
+    if not re.search(
+        r',\s*(?:Generic\s+drugs?|Preferred\s+brand(?:\s+drugs?)?|'
+        r'Non[-\s]+preferred\s+brand(?:\s+drugs?)?)\s*:',
+        consolidated,
+        re.I,
+    ):
+        return False
+    # UHC per-tier cells: "Tier 1: $25, Mail-Order: $50, Specialty Drugs: $25"
+    if re.match(r'\s*Tier\s*\d+', consolidated, re.I):
+        return False
+    return True
+
+
+def _normalize_comma_tier_separators(consolidated: str) -> str:
+    """Convert comma-separated drug rows to ' / ' tier separators."""
+    if not consolidated or not _should_normalize_comma_tier_separators(consolidated):
+        return consolidated
+    return _TIER_COMMA_BOUNDARY.sub(" / ", consolidated)
+
+
 def _split_consolidated_tier_parts(consolidated: str) -> list[str]:
     """Split consolidated RX on tier boundaries without breaking in-cell '/ retail supply'
     or Specialty Drugs sub-rows (Generic / Preferred / Non-Preferred)."""
     if not consolidated:
         return []
+    consolidated = _normalize_comma_tier_separators(consolidated)
     normalized = _TIER_SEMICOLON.sub(" / ", consolidated)
     context_text = _normalize_tier_label(consolidated)
     segments = [s.strip() for s in normalized.split(" / ") if s.strip()]
@@ -1122,6 +1156,7 @@ def _extract_tier_values(consolidated: str) -> dict[int, str]:
     """
     if not consolidated:
         return {}
+    consolidated = _normalize_comma_tier_separators(consolidated)
     context_text = _normalize_tier_label(consolidated)
 
     # Newline-separated output: each line is one complete tier entry and its
@@ -1248,6 +1283,11 @@ def _strip_rx_suffix(value: str) -> str:
     parts = [p.strip() for p in value.split(" / ")]
     stripped: list[str] = []
     for p in parts:
+        # "$X copay/prescription" → "$X"  (Premera flat-copay shorthand)
+        m = re.match(r'^(\$\d+(?:\.\d+)?)\s*copay/prescription\s*$', p, flags=re.IGNORECASE)
+        if m:
+            stripped.append(m.group(1))
+            continue
         # "$X/prescription[, deductible...]" → "$X"  (flat-copay shorthand; not coinsurance)
         m = re.match(r'^(\$\d+(?:\.\d+)?)/prescription\b.*$', p, flags=re.IGNORECASE)
         if m:
