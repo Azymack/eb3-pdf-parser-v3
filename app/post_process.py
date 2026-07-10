@@ -787,8 +787,23 @@ def _collapse_inline_subrow_costs(value: str) -> str:
     return " / ".join(parts)
 
 
-def _is_not_covered_mail_fragment(value: str) -> bool:
+def _is_not_covered_value(value: str) -> bool:
     return value.strip().lower() in _NOT_COVERED_PHRASES
+
+
+def _is_not_covered_mail_fragment(value: str) -> bool:
+    return _is_not_covered_value(value)
+
+
+def _is_oon_pharmacy_not_covered(oon_rx: str) -> bool:
+    """True when the whole OON pharmacy benefit or every parsed tier is Not covered."""
+    if not oon_rx:
+        return False
+    if _is_not_covered_value(oon_rx):
+        return True
+    normalized = _normalize_comma_tier_separators(oon_rx)
+    tiers = _extract_tier_values(normalized)
+    return bool(tiers) and all(_is_not_covered_value(v) for v in tiers.values())
 
 
 def _should_normalize_comma_tier_separators(consolidated: str) -> bool:
@@ -1452,17 +1467,22 @@ def apply_post_processing(
     """Normalize RX fields and compute per-tier derived fields."""
     result = dict(fields)
 
-    # Capture OON "Not covered" status BEFORE Pass 1a clears it.
-    # This lets Pass 2 propagate "Not covered" to per-tier OON fields.
-    oon_rx_not_covered = (
-        (result.get("Out-of-Network RX") or "").strip().lower() in _NOT_COVERED_PHRASES
-    )
+    # Capture OON pharmacy "Not covered" BEFORE Pass 1a may rewrite fields.
+    oon_rx_original = result.get("Out-of-Network RX") or ""
+    oon_pharmacy_not_covered = _is_oon_pharmacy_not_covered(oon_rx_original)
 
-    # Pass 1a: "Not covered" / "null" whole-field -> empty string for any RX field.
+    # Pass 1a: "Not covered" / "null" whole-field -> empty string for RX fields,
+    # except consolidated OON pharmacy fields when the entire benefit is Not covered.
     for key, val in result.items():
         if "RX" in key and isinstance(val, str):
             if val.strip().lower() in _NOT_COVERED_PHRASES:
-                result[key] = ""
+                if oon_pharmacy_not_covered and key in (
+                    "Out-of-Network RX",
+                    "Out-of-Network Mail Order RX",
+                ):
+                    result[key] = "Not covered"
+                else:
+                    result[key] = ""
             # RX Deductible fields: a zero/none deductible means "no RX deductible"
             # -> empty string ("$0", "0", "None", "No deductible" are all noise).
             elif key.endswith("RX Deductible") and val.strip().lower() in (
@@ -1470,15 +1490,21 @@ def apply_post_processing(
             ):
                 result[key] = ""
 
-    # Pass 1b: HMO/EPO plans have no OON drug benefit -- clear OON RX fields.
+    # Pass 1b: HMO/EPO with no OON pharmacy benefit -> clear OON RX fields.
+    # When the document explicitly says OON pharmacy is Not covered, preserve that.
     network_type = (result.get("Network Type") or "").strip().lower()
     if any(net in network_type for net in _HMO_EPO_NETWORKS):
-        for field in _OON_RX_FIELDS:
-            if field in result:
-                result[field] = ""
-        # Also prevent Pass 2 from propagating "Not covered" to per-tier OON fields.
-        # HMO/EPO per-tier OON fields should be "" (not applicable), not "Not covered".
-        oon_rx_not_covered = False
+        if oon_pharmacy_not_covered:
+            for field in ("Out-of-Network RX", "Out-of-Network Mail Order RX"):
+                if field in result:
+                    result[field] = "Not covered"
+            if "Out-of-Network RX Deductible" in result:
+                result["Out-of-Network RX Deductible"] = ""
+        else:
+            for field in _OON_RX_FIELDS:
+                if field in result:
+                    result[field] = ""
+            oon_pharmacy_not_covered = False
 
     # Pass 2: compute per-tier fields using label-based mapping.
     # health (2-col): Preferred Network RX + In-Network RX merge into In-Network per-tier.
@@ -1496,7 +1522,7 @@ def apply_post_processing(
     )
     for net_prefix in net_prefixes:
         # Propagate "Not covered" to all per-tier OON fields when applicable.
-        if net_prefix == "Out-of-Network" and oon_rx_not_covered:
+        if net_prefix == "Out-of-Network" and oon_pharmacy_not_covered:
             for suffix in _TIER_SUFFIXES:
                 field_name = f"Out-of-Network {suffix}"
                 if field_name in output_field_names:
@@ -1598,6 +1624,21 @@ def apply_post_processing(
         elif designated_tier_fields and net_prefix != "Designated Network":
             # health_3tier INN/OON columns with no embedded mail → no mail benefit.
             # Clears VLM mail wrongly copied from the Designated column.
-            result[mo_field] = ""
+            if not (
+                oon_pharmacy_not_covered
+                and mo_field == "Out-of-Network Mail Order RX"
+            ):
+                result[mo_field] = ""
+
+    if oon_pharmacy_not_covered:
+        if (
+            "Out-of-Network RX" in output_field_names
+            and _is_not_covered_value(oon_rx_original)
+        ):
+            result["Out-of-Network RX"] = "Not covered"
+        if "Out-of-Network Mail Order RX" in output_field_names:
+            mo = result.get("Out-of-Network Mail Order RX") or ""
+            if not mo or _is_not_covered_value(mo):
+                result["Out-of-Network Mail Order RX"] = "Not covered"
 
     return result

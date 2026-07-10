@@ -52,8 +52,9 @@ def test_vlm_field_names_excludes_computed():
 
 
 def test_apply_post_processing_normalizes_not_covered():
-    """'Not covered' whole-field values in RX fields become empty string."""
+    """Whole-field Not covered on OON pharmacy is preserved and propagated to tiers."""
     fields = {
+        "Network Type": "PPO",
         "Carrier Name": "Acme",
         "In-Network RX": "Tier 1: $10",
         "Out-of-Network RX": "Not covered",
@@ -62,9 +63,25 @@ def test_apply_post_processing_normalizes_not_covered():
     }
     result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
     assert result["In-Network RX"] == "Tier 1: $10"
-    assert result["Out-of-Network RX"] == ""
-    assert result["Out-of-Network Mail Order RX"] == ""
+    assert result["Out-of-Network RX"] == "Not covered"
+    assert result["Out-of-Network Mail Order RX"] == "Not covered"
+    assert result["Out-of-Network Generic RX"] == "Not covered"
+    assert result["Out-of-Network Brand RX"] == "Not covered"
     assert result["Carrier Name"] == "Acme"
+
+
+def test_hmo_oon_pharmacy_not_covered_preserved():
+    """HMO with explicit OON pharmacy Not covered shows Not covered, not blank."""
+    fields = {
+        "Network Type": "HMO",
+        "In-Network RX": "Generic: $10 / Brand: $40",
+        "Out-of-Network RX": "Not covered",
+    }
+    result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+    assert result["Out-of-Network RX"] == "Not covered"
+    assert result["Out-of-Network Generic RX"] == "Not covered"
+    assert result["Out-of-Network Brand RX"] == "Not covered"
+    assert result["Out-of-Network Mail Order RX"] == "Not covered"
 
 
 def test_apply_post_processing_clears_oon_rx_for_hmo():
@@ -696,6 +713,66 @@ class TestApplyPostProcessingLabelBased:
         assert result["In-Network Mail Order RX"] == (
             "$50 / 50% coinsurance with a $300 copay maximum / 50% coinsurance"
         )
+
+    def test_hmo_whole_field_not_covered_27833il0140061(self):
+        """27833IL0140061-00 — VLM returns whole-field Not covered on HMO OON pharmacy."""
+        fields = {
+            "Network Type": "HMO",
+            "In-Network RX": (
+                "Tier 1a - Preferred: No charge / Tier 1b - Generic Retail: No charge / "
+                "Tier 2 - Retail: No charge / Tier 3 - Retail: No charge / "
+                "Tier 4 - Retail: No charge"
+            ),
+            "Out-of-Network RX": "Not covered",
+            "Out-of-Network Mail Order RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["Out-of-Network RX"] == "Not covered"
+        assert result["Out-of-Network Generic RX"] == "Not covered"
+        assert result["Out-of-Network Brand RX"] == "Not covered"
+        assert result["Out-of-Network Tier 3 RX"] == "Not covered"
+        assert result["Out-of-Network Tier 4 RX"] == "Not covered"
+        assert result["Out-of-Network Tier 5 RX"] == "Not covered"
+        assert result["Out-of-Network Mail Order RX"] == "Not covered"
+
+    def test_hmo_whole_field_not_covered_41047oh0030057(self):
+        """41047OH0030057-00 — same HMO whole-field Not covered layout."""
+        fields = {
+            "Network Type": "HMO",
+            "In-Network RX": "Tier 1a - Preferred Generic Retail: $3 Copay / Tier 2 - Retail: 45% Coinsurance",
+            "Out-of-Network RX": "Not covered",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["Out-of-Network RX"] == "Not covered"
+        assert result["Out-of-Network Generic RX"] == "Not covered"
+        assert result["Out-of-Network Mail Order RX"] == "Not covered"
+
+    def test_ppo_labeled_all_rows_not_covered_1783617094(self):
+        """1783617094 — every OON drug row Not covered; all tiers + mail show Not covered."""
+        fields = {
+            "Network Type": "PPO",
+            "In-Network RX": (
+                "Generic: No charge after deductible / Preferred Brand: No charge after deductible / "
+                "Non-preferred Brand: No charge after deductible / "
+                "Specialty Drugs: No charge after deductible"
+            ),
+            "Out-of-Network RX": (
+                "Generic: Not covered / Preferred Brand: Not covered / "
+                "Non-preferred Brand: Not covered / Specialty Drugs: Not covered"
+            ),
+            "Out-of-Network Mail Order RX": "",
+        }
+        result = apply_post_processing(fields, CATEGORY_FIELDS["health"])
+        assert result["Out-of-Network RX"] == (
+            "Generic: Not covered / Preferred Brand: Not covered / "
+            "Non-preferred Brand: Not covered / Specialty Drugs: Not covered"
+        )
+        assert result["Out-of-Network Generic RX"] == "Not covered"
+        assert result["Out-of-Network Brand RX"] == "Not covered"
+        assert result["Out-of-Network Tier 3 RX"] == "Not covered"
+        assert result["Out-of-Network Tier 4 RX"] == "Not covered"
+        assert result["Out-of-Network Tier 5 RX"] == "Not covered"
+        assert result["Out-of-Network Mail Order RX"] == "Not covered"
 
     def test_aetna_flat_oon_broadcast_1781127953(self):
         """Aetna POS — VLM collapses repeated OON column to one unlabeled coinsurance."""
