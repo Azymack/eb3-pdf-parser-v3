@@ -85,6 +85,25 @@ _NARRATIVE_KEYWORDS: list[str] = [
     "means", "refers to", "defined as", "following services", "benefit summary",
 ]
 
+# Health only: phrases that identify real benefit-table rows. These get a strong
+# bonus so service pages (hospital stay, urgent care, imaging) beat the SBC
+# "Coverage Examples" page, which is dense with generic keywords (deductible,
+# copayments, specialist, childbirth) but contains no plan values.
+_HEALTH_SERVICE_ROW_PHRASES: list[str] = [
+    "hospital stay", "facility fee", "urgent care", "emergency room",
+    "outpatient surgery", "childbirth", "imaging (ct",
+    "advanced diagnostic imaging", "ambulatory surg", "physician/surgeon",
+]
+
+# Markers of the SBC "Coverage Examples" page (sample-cost illustrations,
+# not plan benefits).
+_COVERAGE_EXAMPLE_MARKERS: list[str] = [
+    "total example cost", "about these coverage examples",
+    "this is not a cost estimator", "isn't a cost estimator",
+]
+
+_HEALTH_CATEGORIES: frozenset[str] = frozenset({"health", "health_3tier"})
+
 
 # RX-specific routing: the pharmacy table can sit on a page that scores poorly
 # on general health keywords (e.g. Benefit Summaries with a dedicated pharmacy
@@ -149,6 +168,13 @@ def select_pages(
 
         score = sum(1.0 for kw in keywords if kw in text)
         score += 0.5 * sum(1.0 for kw in _NARRATIVE_KEYWORDS if kw in text)
+
+        if category in _HEALTH_CATEGORIES:
+            score += 2.0 * sum(
+                1.0 for phrase in _HEALTH_SERVICE_ROW_PHRASES if phrase in text
+            )
+            if any(marker in text for marker in _COVERAGE_EXAMPLE_MARKERS):
+                score -= 10.0
 
         scored.append((page_num, score))
 

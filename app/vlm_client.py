@@ -8,8 +8,9 @@ System prompt composition
 Rather than one monolithic prompt for every category, the system prompt is
 assembled from three blocks:
 
-  _BASE_PROMPT          — universal extraction instructions (all categories)
-  _SINGLE_COLUMN_PROMPT — in/out-of-network table guidance (dental, vision, health, health_3tier)
+  _BASE_PROMPT                     — universal extraction instructions (all categories)
+  _SINGLE_COLUMN_PROMPT            — in/out-of-network table guidance (dental, vision, health, health_3tier)
+  _HEALTH_FIELD_DEFINITIONS_PROMPT — service-field semantics (health, health_3tier)
 
 Prescription drug (RX) fields are NOT extracted here: health and health_3tier
 RX fields are handled by the dedicated structured extraction in rx_extractor.py.
@@ -36,6 +37,12 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=5.0)
 # Categories that have per-service In-Network / Out-of-Network cost columns.
 _NETWORK_TABLE_CATEGORIES: frozenset[str] = frozenset({
     "dental", "vision", "health", "health_3tier",
+})
+
+# Health categories get service-field definitions (documents name the same
+# benefit rows very differently across carriers).
+_HEALTH_CATEGORIES: frozenset[str] = frozenset({
+    "health", "health_3tier",
 })
 
 # Block 1 — universal (all categories).
@@ -66,11 +73,49 @@ _SINGLE_COLUMN_PROMPT = (
     "and, if so, treat a missing OON service column as 'same as In-Network'."
 )
 
+# Block 3 — health service-field definitions.
+# Carriers name the same benefit rows differently; match fields by MEANING.
+_HEALTH_FIELD_DEFINITIONS_PROMPT = (
+    "\n\nFIELD DEFINITIONS — match these fields by meaning, not by exact wording; "
+    "documents name the same benefit rows differently:\n"
+    "- 'Inpatient Surgery': the hospital-stay FACILITY FEE (hospital room / room & "
+    "board). Row names include 'If you have a hospital stay - Facility fee (e.g., "
+    "hospital room)', 'Hospital Stay', 'Inpatient Hospital Services'. Do NOT use "
+    "the physician/surgeon fees row, and NEVER copy the Outpatient Surgery value "
+    "here — inpatient and outpatient facility fees are different rows.\n"
+    "- 'Outpatient Surgery': the outpatient-surgery FACILITY FEE row (e.g. "
+    "'Facility fee (e.g., ambulatory surgery center)'), not physician/surgeon "
+    "fees.\n"
+    "- 'Newborn Delivery': the 'Childbirth/delivery facility services' row (the "
+    "delivery/facility cost), not childbirth professional services.\n"
+    "- 'CT scan, PT scan, MRI': the ADVANCED IMAGING row — 'Imaging (CT/PET "
+    "scans, MRIs)', 'Advanced Diagnostic Imaging (for example: MRI, PET and CAT "
+    "scans)', 'MRI/CT/PET scans'.\n"
+    "- 'Major Diagnostics': the basic diagnostic test row — 'Diagnostic test "
+    "(x-ray, blood work)', laboratory and x-ray services. Keep this separate from "
+    "'CT scan, PT scan, MRI': x-ray/blood work here, advanced imaging there.\n"
+    "MULTIPLE PLACE-OF-SERVICE SUB-ROWS: when a benefit lists separate costs per "
+    "setting (e.g. Office / Freestanding Radiology Center / Outpatient Hospital "
+    "for imaging, or Hospital / Ambulatory Surgical Center for outpatient "
+    "surgery), include ALL settings in the field value, labeled and joined with "
+    "' / '. Example: 'Office: 20% coinsurance / Freestanding Radiology Center: "
+    "20% coinsurance / Outpatient Hospital: $500 then 20% coinsurance'. NEVER "
+    "keep only the first setting's cost.\n"
+    "NO OUT-OF-NETWORK COVERAGE: when the plan's out-of-network service columns "
+    "show 'Not covered' (HMO/EPO-style plans), set the Out-of-Network Deductible, "
+    "OOP Max, and Coinsurance fields to 'Not covered' — do NOT copy the "
+    "In-Network amounts into them. The single-column rule above applies ONLY "
+    "when the plan actually covers out-of-network care."
+)
+
+
 def _build_system_prompt(category: str, display_category: str) -> str:
     """Compose a category-appropriate system prompt from the relevant blocks."""
     parts = [_BASE_PROMPT.format(display_category=display_category)]
     if category in _NETWORK_TABLE_CATEGORIES:
         parts.append(_SINGLE_COLUMN_PROMPT)
+    if category in _HEALTH_CATEGORIES:
+        parts.append(_HEALTH_FIELD_DEFINITIONS_PROMPT)
     return "".join(parts)
 
 
