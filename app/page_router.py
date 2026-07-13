@@ -86,6 +86,50 @@ _NARRATIVE_KEYWORDS: list[str] = [
 ]
 
 
+# RX-specific routing: the pharmacy table can sit on a page that scores poorly
+# on general health keywords (e.g. Benefit Summaries with a dedicated pharmacy
+# page), so the RX extraction call selects its own pages.
+_RX_KEYWORDS: list[str] = [
+    "prescription", "pharmacy", "generic", "formulary", "specialty",
+    "mail order", "mail-order", "home delivery", "brand", "tier", "drug",
+]
+
+_RX_COST_MARKERS: tuple[str, ...] = ("$", "coinsurance", "copay", "no charge")
+
+
+def select_rx_pages(
+    docling_pages: list[dict[str, Any]],
+    top_n: int = 4,
+) -> list[int]:
+    """Return 1-based page numbers likely to contain the pharmacy cost table.
+
+    Pages mentioning drug tiers alongside cost markers get a strong boost so a
+    dedicated pharmacy page beats generic benefit pages. Returns an empty list
+    when no page looks RX-related (caller falls back to category routing).
+    """
+    scored: list[tuple[int, float]] = []
+    for page in docling_pages:
+        page_num: int = page["page_number"]
+        text: str = page.get("markdown", "").lower()
+        score = sum(1.0 for kw in _RX_KEYWORDS if kw in text)
+        has_tier_words = "generic" in text and (
+            "brand" in text or "tier" in text or "level" in text or "specialty" in text
+        )
+        if has_tier_words and any(m in text for m in _RX_COST_MARKERS):
+            score += 6.0
+        scored.append((page_num, score))
+
+    scored.sort(key=lambda x: (-x[1], x[0]))
+    selected = [pnum for pnum, score in scored[:top_n] if score >= 3.0]
+    selected.sort()
+
+    logger.info(
+        "page_router: RX pages selected",
+        extra={"selected": selected, "top_n": top_n},
+    )
+    return selected
+
+
 def select_pages(
     docling_pages: list[dict[str, Any]],
     category: str,

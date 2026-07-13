@@ -51,17 +51,29 @@ FAKE_IMAGES = [
     {"page_number": 2, "image_b64": "bbb=", "width": 800, "height": 1000},
 ]
 
+# What the structured RX extraction returns (already-assembled flat fields)
+RX_FIELDS_RESPONSE = {
+    "In-Network RX": "Tier 1 (Generic): $10 / Tier 2 (Brand): $40 / Tier 3: 50%",
+    "In-Network Mail Order RX": "$20 / $80",
+    "In-Network Generic RX": "$10",
+    "In-Network Brand RX": "$40",
+    "In-Network Tier 3 RX": "50%",
+    "Out-of-Network RX": "Not covered",
+}
+
 
 @pytest.fixture
 def mock_pipeline():
-    """Patch all three external-touching functions."""
+    """Patch all external-touching functions (docling, both VLM calls, renderer)."""
     with (
         patch("app.main.convert_pdf", new_callable=AsyncMock) as mock_docling,
         patch("app.main.extract_fields", new_callable=AsyncMock) as mock_vlm,
+        patch("app.main.extract_rx_fields", new_callable=AsyncMock) as mock_rx,
         patch("app.main.render_pages", return_value=FAKE_IMAGES) as mock_render,
     ):
         mock_docling.return_value = DOCLING_RESPONSE
         mock_vlm.return_value = VLM_RESPONSE
+        mock_rx.return_value = dict(RX_FIELDS_RESPONSE)
         yield mock_docling, mock_vlm, mock_render
 
 
@@ -322,11 +334,11 @@ async def test_rx_tier_string_passed_through_to_response(mock_pipeline):
         )
     assert response.status_code == 200
     body = response.json()
-    # New field present, value passed through verbatim
+    # RX fields come from the structured RX extraction, passed through verbatim
     assert body["In-Network RX"] == "Tier 1 (Generic): $10 / Tier 2 (Brand): $40 / Tier 3: 50%"
-    assert body["In-Network Mail Order RX"] == "$20 / $80"  # labels stripped by Pass 3
-    # Per-tier fields now appear (computed from consolidated), mail-order tier variants never should
-    assert "In-Network Generic RX" in body  # computed from In-Network RX
+    assert body["In-Network Mail Order RX"] == "$20 / $80"
+    assert body["In-Network Generic RX"] == "$10"
+    assert body["Out-of-Network RX"] == "Not covered"
     assert "In-Network Generic Mail Order RX" not in body
     assert "In-Network Brand Mail Order RX" not in body
 
@@ -342,15 +354,15 @@ async def test_vlm_prompt_does_not_request_old_rx_fields(mock_pipeline):
             files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
             data={"category": "health"},
         )
-    # extract_fields was called — check its field_names argument
+    # extract_fields was called — the main call must not see ANY RX fields;
+    # those belong to the structured RX extraction (rx_extractor.py).
     call_args = mock_vlm.call_args
     field_names_used = call_args.kwargs.get("field_names") or call_args.args[1]
-    assert "In-Network RX" in field_names_used
-    assert "In-Network Mail Order RX" in field_names_used
-    assert "In-Network Generic RX" not in field_names_used
-    assert "In-Network Brand RX" not in field_names_used
-    assert "In-Network Tier 3 RX" not in field_names_used
-    assert "In-Network Generic Mail Order RX" not in field_names_used
+    assert not [f for f in field_names_used if "RX" in f], (
+        f"main VLM call still requests RX fields: "
+        f"{[f for f in field_names_used if 'RX' in f]}"
+    )
+    assert "Carrier Name" in field_names_used
 
 
 @pytest.mark.asyncio

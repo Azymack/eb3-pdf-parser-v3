@@ -1,0 +1,33 @@
+Carrier,Document Type,Coverage Line,Document Name,Result,Notes
+Aetna,SBC,Health,1781127953,Fail,Out-of-Network charges for Prescription Drug Coverage did not scrapped
+Ambetter Health,SBC,Health,27833IL0140061-00,Fail,"CT scan, PT scan, MRI charges scrapped incorrectly, RX OON charges also not scraped"
+Ambetter Health,SBC,Health,41047OH0030057-00,Fail,"CT scan, PT scan, MRI charges scrapped incorrectly, RX OON charges also not scraped"
+AmeriHealth,SBC,Health,1774285609-6045,Fail,Prescription Drug Coverage scrapped incorrectly except( Generic & Speciality)
+AmeriHealth,SBC,Health,1774285635-9232,Fail,Most of the Benefits scrapped incorrectly
+AmeriHealth,SBC,Health,1774285667-7788,Fail,Prescription Drug Coverage scrapped incorrectly except( Generic & Speciality)
+AmeriHealth,SBC,Health,1774285699-5332,Fail,Prescription Drug Coverage scrapped incorrectly except( Generic & Speciality)
+AmeriHealth,SBC,Health,1774298734-3130,Fail,Most of the Benefits scrapped incorrectly
+Angle Health,SBC,Health,1783617094,Fail,Mail Order  - 90 day Supply charges were not scrapped
+Anthem Blue Cross,SBC,Health,1781646658,Fail,"Rx charges: Tier 2, Tier 3, Mail Order  - 90 day Supply scraped incorrectly"
+Anthem Blue Cross,SBC,Health,1783368626,Fail,"CT scan, PT scan, MRI charges and Tier 2, Tier 3, Mail Order  - 90 day Supply scraped incorrectly"
+Anthem Blue Cross,SBC,Health,1780511663,Fail,Prescription Drug Coverage did not scrapped correctly
+Anthem Blue Cross,Benefit Summary,Health,1781204114,Fail,"Outpatient Surgery, CT scan, PT scan, MRI scrapped incorrectly"
+Anthem Blue Cross,Benefit Summary,Health,1773249674,Fail,"Outpatient Surgery, Inpatient Hospitalization / Surgery, Hospital Newborn Delivery, Mail Order - 90 day Supply---  all these charges scraped incorrectly."
+Anthem Blue Cross,Benefit Summary,Health,1781204187,Fail,"Outpatient Surgery, Inpatient Hospitalization / Surgery, Hospital Newborn Delivery, Mail Order - 90 day Supply---  all these charges scraped incorrectly."
+Anthem Blue Cross Colorado,Benefit Summary,Health,Anthem Virtual Access Plus Bronze Pathway EPO 6500_7200 w_HSA WH_CO_EPO_Small Group_8TQV,Fail,"Inpatient Hospitalization / Surgery and Hospital Newborn Delivery) and CT scan, PT scan, MRI charges scraped incorrect"
+Anthem Blue Cross Colorado,SBC,Health,Anthem Clear Choice Silver PPO 75_0__9100 Rx Copay_CO_PPO_Small Group_982U,Fail,RX- OON charges did not scraped.
+Aspirus Health Plan,SBC,Health,State of Wisconsin and WPE Local-High Deductible Health Plan,Fail,"RX charges didn't scrape at all, tried twice. "
+Aspirus Health Plan,SBC,Health,WPE- Local Deductible Uniform Benefits,Fail,"RX charges didn't scrape at all, tried twice. "
+Aspirus Health Plan,SBC,Health,WPE- Local Traditional Uniform Benefits,Fail,"RX charges didn't scrape at all, tried twice. "
+AvMed,SBC,Health,Elect S100-SG26-AVSGHS302401260425,Fail,"RX charges didn't scrape at all, tried twice. "
+AvMed,SBC,Health,Elect S340-SG26-AVSGHS302801260425,Fail,"RX charges didn't scrape at all, tried twice. "
+AvMed,SBC,Health,Elect S440-SG26-AVSGHS304301260425,Fail,"RX charges didn't scrape at all, tried twice. "
+Blue Cross and Blue Shield of Arizona,Benefit Summary,Health,Individual HMO StandardHealth Gold 2000,Fail,"RX charges didn't scrape at all, tried twice. "
+Blue Cross and Blue Shield of Arizona,Benefit Summary,Health,Individual HMO StandardHealth Silver 4 ,Fail,"RX charges didn't scrape at all, tried twice. "
+Blue Cross and Blue Shield of Louisiana,SBC,Health,1769184308,Fail,"RX charges didn't scrape at all, tried twice."
+Blue Cross and Blue Shield of Michigan,SBC,Health,Blue Cross® Preferred HMO Silver Saver,Fail,RX- OON charges not scraped. in summary it states OON charges as Not covered. so it should be scraped as what it is mentioned in summary rather than a blank field. 
+Blue Cross and Blue Shield of Michigan,SBC,Health,Blue Cross® Preferred HMO Gold,Fail,RX- OON charges not scraped. in summary it states OON charges as Not covered. so it should be scraped as what it is mentioned in summary rather than a blank field. 
+Blue Cross and Blue Shield of Michigan,SBC,Health,Blue Cross® Local HMO Silver Plus,Fail,RX- OON charges not scraped. in summary it states OON charges as Not covered. so it should be scraped as what it is mentioned in summary rather than a blank field. 
+Blue Cross and Blue Shield of New Mexico,SBC,Health,1780607919,Fail,"OON charges for Deductible, Out of Pocket Maximum should be as Not covered rather than same amount of IN-Network and for RX OON-- the charges should be as Not covered rather than blank field. "
+BlueCross Blueshield of Oklahoma,SBC,Health,1783348183,Fail,Inpatient Hospitalization / Surgery & Urgent care scrapped Incorrectly
+BlueCross Blueshield of Oklahoma,SBC,Health,1783348938,Fail,Inpatient Hospitalization / Surgery & Urgent care scrapped Incorrectly

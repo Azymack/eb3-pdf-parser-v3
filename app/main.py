@@ -11,8 +11,14 @@ from .auth import verify_token
 from .config import get_settings
 from .docling_client import convert_pdf
 from .image_renderer import render_pages
-from .page_router import select_pages
+from .page_router import select_pages, select_rx_pages
 from .post_process import apply_post_processing, vlm_field_names
+from .rx_extractor import (
+    RX_EXTRACTOR_CATEGORIES,
+    extract_rx_fields,
+    rx_owned_fields,
+    suppress_medical_deductible_echo,
+)
 from .schemas import (
     CATEGORY_FIELDS,
     VALID_CATEGORIES,
@@ -235,18 +241,62 @@ async def _run_pipeline(
     ]
 
     # ── Stage 4: VLM extraction ───────────────────────────────────────────────
-    # Computed fields (e.g. combined Mail Order RX) are excluded from the VLM
-    # prompt and derived from the individual tier values in post-processing.
+    # For RX categories, pharmacy fields are extracted by a dedicated structured
+    # RX call (app/rx_extractor.py) that runs concurrently with the main call.
+    # The main call never sees RX fields.
     logger.info("pipeline[4/4]: VLM extraction — start")
     t0 = time.monotonic()
     vlm_fields = vlm_field_names(field_names)
+    rx_enabled = category in RX_EXTRACTOR_CATEGORIES
+    rx_fields: dict[str, str] | None = None
+    if rx_enabled:
+        owned = set(rx_owned_fields(category))
+        vlm_fields = [f for f in vlm_fields if f not in owned]
+        rx_page_numbers = select_rx_pages(pages) or selected_page_numbers
+        try:
+            rx_images = (
+                rendered_images
+                if rx_page_numbers == selected_page_numbers
+                else render_pages(pdf_bytes, rx_page_numbers)
+            )
+        except Exception:
+            logger.exception("pipeline[4/4]: RX page rendering failed — "
+                             "falling back to category pages")
+            rx_page_numbers = selected_page_numbers
+            rx_images = rendered_images
+        rx_markdowns = [
+            {"page_number": n, "markdown": page_markdown_by_num.get(n, "")}
+            for n in rx_page_numbers
+        ]
+        logger.info(f"pipeline[4/4]: RX extraction pages={rx_page_numbers}")
+
     try:
-        vlm_result = await extract_fields(
+        main_coro = extract_fields(
             category=category,
             field_names=vlm_fields,
             page_markdowns=selected_markdowns,
             page_images=rendered_images,
         )
+        if rx_enabled:
+            gathered = await asyncio.gather(
+                main_coro,
+                extract_rx_fields(category, rx_markdowns, rx_images),
+                return_exceptions=True,
+            )
+            if isinstance(gathered[0], BaseException):
+                raise gathered[0]
+            vlm_result = gathered[0]
+            if isinstance(gathered[1], BaseException):
+                logger.error(
+                    "pipeline[4/4]: structured RX extraction failed — "
+                    "RX fields will be empty",
+                    exc_info=gathered[1],
+                )
+                rx_fields = {f: "" for f in rx_owned_fields(category)}
+            else:
+                rx_fields = gathered[1]
+        else:
+            vlm_result = await main_coro
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="VLM service unreachable")
     except httpx.HTTPStatusError as exc:
@@ -266,6 +316,9 @@ async def _run_pipeline(
     # ── Post-processing: compute derived fields, then serialize ───────────────
     raw_fields = vlm_result.get("fields", {})
     processed_fields = apply_post_processing(raw_fields, field_names)
+    if rx_fields is not None:
+        suppress_medical_deductible_echo(rx_fields, raw_fields)
+        processed_fields.update(rx_fields)
     serialized_fields = _nulls_to_empty(processed_fields)
     serialized_fields = {k: serialized_fields[k] for k in field_names if k in serialized_fields}
 
