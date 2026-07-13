@@ -36,6 +36,23 @@ app = FastAPI(title="eb3-pdf-parser-v3", version="2.0.0")
 _PDF_MAGIC = b"%PDF"
 
 
+def _mirror_ct_into_major_diagnostics(
+    fields: dict,
+    field_names: list[str],
+) -> None:
+    """Overwrite Major Diagnostics with the CT/PET/MRI (advanced imaging) value.
+
+    Downstream consumers of this API read 'Major Diagnostics' as CT/PT/MRI, so
+    the final response mirrors the dedicated imaging field into it — for every
+    network prefix present in the category (health and health_3tier).
+    """
+    for prefix in ("Designated Network", "In-Network", "Out-of-Network"):
+        md = f"{prefix} Major Diagnostics"
+        ct = f"{prefix} CT scan, PT scan, MRI"
+        if md in field_names and ct in field_names:
+            fields[md] = fields.get(ct)
+
+
 def _nulls_to_empty(fields: dict) -> dict[str, str]:
     """Coerce all field values to str for API output.
 
@@ -319,6 +336,7 @@ async def _run_pipeline(
     if rx_fields is not None:
         suppress_medical_deductible_echo(rx_fields, raw_fields)
         processed_fields.update(rx_fields)
+    _mirror_ct_into_major_diagnostics(processed_fields, field_names)
     serialized_fields = _nulls_to_empty(processed_fields)
     serialized_fields = {k: serialized_fields[k] for k in field_names if k in serialized_fields}
 

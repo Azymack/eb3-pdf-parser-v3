@@ -39,6 +39,9 @@ VLM_RESPONSE = {
         "Plan Name": "Gold PPO",
         "In-Network Single Deductible": "$500",
         "In-Network Family Deductible": "$1000",
+        "In-Network Major Diagnostics": "$30 copay (x-ray, blood work)",
+        "In-Network CT scan, PT scan, MRI": "$250/day; then 30% coinsurance",
+        "Out-of-Network CT scan, PT scan, MRI": "50% coinsurance",
         "In-Network RX": "Tier 1 (Generic): $10 / Tier 2 (Brand): $40 / Tier 3: 50%",
         "In-Network Mail Order RX": "Tier 1: $20 / Tier 2: $80",
     },
@@ -363,6 +366,25 @@ async def test_vlm_prompt_does_not_request_old_rx_fields(mock_pipeline):
         f"{[f for f in field_names_used if 'RX' in f]}"
     )
     assert "Carrier Name" in field_names_used
+
+
+@pytest.mark.asyncio
+async def test_major_diagnostics_mirrors_ct_pt_mri(mock_pipeline):
+    """Downstream reads Major Diagnostics as CT/PT/MRI — the response must
+    mirror the imaging value into it, including empty when imaging is empty."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/extract_json_v2",
+            headers=HEADERS_OK,
+            files={"file": ("plan.pdf", FAKE_PDF, "application/pdf")},
+            data={"category": "health"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["In-Network CT scan, PT scan, MRI"] == "$250/day; then 30% coinsurance"
+    assert body["In-Network Major Diagnostics"] == "$250/day; then 30% coinsurance"
+    # OON imaging was extracted; OON Major Diagnostics mirrors it too
+    assert body["Out-of-Network Major Diagnostics"] == "50% coinsurance"
 
 
 @pytest.mark.asyncio
