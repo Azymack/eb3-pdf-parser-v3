@@ -217,4 +217,4 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-tests/documents/Testing_Puneet_Daksh/
+tests/
