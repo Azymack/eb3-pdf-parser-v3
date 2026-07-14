@@ -1327,9 +1327,9 @@ def _strip_rx_suffix(value: str) -> str:
     parts = [p.strip() for p in value.split(" / ")]
     stripped: list[str] = []
     for p in parts:
-        # "$X copay/prescription" → "$X"  (Premera flat-copay shorthand;
-        # tolerate a space after the slash: "$25 copay/ prescription")
-        m = re.match(r'^(\$\d+(?:\.\d+)?)\s*copay/\s*prescription\s*$', p, flags=re.IGNORECASE)
+        # "$X copay/prescription" / "$X copayment/prescription" → "$X"
+        # (tolerate spaces around the slash: "$25 copay/ prescription")
+        m = re.match(r'^(\$\d+(?:\.\d+)?)\s*copay(?:ment)?\s*/\s*prescription\s*$', p, flags=re.IGNORECASE)
         if m:
             stripped.append(m.group(1))
             continue

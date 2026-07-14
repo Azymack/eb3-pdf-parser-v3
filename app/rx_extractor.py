@@ -38,7 +38,12 @@ import logging
 import re
 from typing import Any
 
-from .post_process import _strip_rx_suffix
+from .post_process import (
+    _extract_home_delivery,
+    _extract_retail_only,
+    _split_retail_mail,
+    _strip_rx_suffix,
+)
 from .vlm_client import _chat_completion
 
 logger = logging.getLogger(__name__)
@@ -115,12 +120,15 @@ def _build_rx_schema(category: str) -> dict:
             "enum": list(_STANDARD_TIERS) + ["other"],
         },
     }
-    for key in net_keys:
-        row_props[f"{key}_retail"] = _nullable_string()
-        row_props[f"{key}_mail_order"] = _nullable_string()
+    # preferred_pharmacy keys go BEFORE the network keys: guided decoding walks
+    # properties in declaration order, and trailing keys are prone to being
+    # dropped when the model closes the object early.
     if category == "health":
         row_props["preferred_pharmacy_retail"] = _nullable_string()
         row_props["preferred_pharmacy_mail_order"] = _nullable_string()
+    for key in net_keys:
+        row_props[f"{key}_retail"] = _nullable_string()
+        row_props[f"{key}_mail_order"] = _nullable_string()
 
     top_props: dict[str, Any] = {
         "drug_rows": {
@@ -165,6 +173,38 @@ _RX_SYSTEM_PROMPT_HEALTH_NETWORKS = (
     "preferred_pharmacy_retail and the Participating amount goes to in_network_retail). "
     "null when no separate preferred pharmacy level exists.\n"
     "- out_of_network_*: the out-of-network / non-participating pharmacy column.\n"
+    "THREE COST COLUMNS: when the pharmacy table has three cost columns — e.g. "
+    "'Preferred Network Pharmacy (You will pay the least)' | 'In-Network "
+    "Provider/Pharmacy (You will pay more)' | 'Out-of-Network Provider (You will "
+    "pay the most)' — the FIRST column is preferred_pharmacy_*, the SECOND is "
+    "in_network_*, the THIRD is out_of_network_*. Fill preferred_pharmacy_retail "
+    "and preferred_pharmacy_mail_order from that first column for EVERY row; "
+    "never skip it.\n"
+    "MULTIPLE PRICES IN ONE CELL — decide what each extra price is by its marker:\n"
+    "1. CHANNEL markers (retail, home delivery, mail order, 90-day supply) → the "
+    "prices are the retail and mail_order channels of the SAME column. Example "
+    "(3-column layout): Preferred Network Pharmacy column 'Tier 1: "
+    "$10/prescription (retail) and $25/prescription (home delivery)' and "
+    "In-Network Pharmacy column '$20/prescription (retail only)' → "
+    "preferred_pharmacy_retail '$10', preferred_pharmacy_mail_order '$25', "
+    "in_network_retail '$20', in_network_mail_order null. NEVER drop the "
+    "Preferred Network Pharmacy column's prices.\n"
+    "2. PHARMACY LEVEL markers (Preferred/Non-Preferred pharmacy, "
+    "Preferred/Standard pharmacy, Level A/Level B, Preferred/Participating): "
+    "copy the ENTIRE cell text VERBATIM into in_network_retail keeping BOTH "
+    "level prices — e.g. 'Preferred - No Charge Non-Preferred - $10 "
+    "copayment/prescription', 'Level A - $10/prescription Level B - "
+    "$20/prescription', 'Preferred Pharmacy 30-day supply: You pay $0 Standard "
+    "Pharmacy 30-day supply: You pay $5'. Put a separately printed Mail price "
+    "('Mail - $30 copayment/prescription') into in_network_mail_order, and "
+    "leave preferred_pharmacy_* null — the two levels are separated later. "
+    "NEVER keep only one level's price and NEVER emit two drug_rows entries "
+    "for one printed row. (Level markers inside the cell are different from "
+    "Preferred/Non-Preferred DRUG tiers in the row label.)\n"
+    "OON PAID AS IN-NETWORK: when the out-of-network pharmacy column says the "
+    "benefit is paid at the in-network level (e.g. 'Paid As In-Network'), record "
+    "that phrase as the out_of_network_retail value — it is a real benefit, "
+    "NOT 'Not covered'.\n"
 )
 
 _RX_SYSTEM_PROMPT_3TIER_NETWORKS = (
@@ -207,11 +247,23 @@ def _build_rx_system_prompt(category: str) -> str:
         "- preferred_specialty: specialty drugs (a lone 'Specialty' row, or the "
         "preferred specialty row when split).\n"
         "- non_preferred_specialty: non-preferred specialty drugs.\n"
-        "- other: preventive/$0-mandate sub-rows, vaccine rows, or rows that are not "
-        "drug cost tiers.\n"
+        "- other: preventive/$0-mandate sub-rows, vaccine rows, insulin-only "
+        "program rows ('Select Insulin Drugs', 'Insulin' gap-coverage rows), or "
+        "rows that are not drug cost tiers.\n"
         "Multiple rows MAY map to the same standard_tier (e.g. preferred + "
         "non-preferred generic both map to generic; 'Value generic drugs (Tier 1)' and "
         "'Generic drugs (Tier 2)' both map to generic). Never skip a printed row.\n"
+        "SPECIALTY PRICE INSIDE EACH TIER CELL (UnitedHealthcare-style): some SBCs "
+        "have no specialty row — instead every tier cell contains a 'Specialty "
+        "Drugs:' price next to Retail and Mail-Order (e.g. 'Tier 1 — Retail: $5 "
+        "copay Mail-Order: $10 copay Specialty Drugs: $5 copay'). In that case: "
+        "put ONLY the Retail price in retail and the Mail-Order price in "
+        "mail_order for each tier row, and ADD one extra drug_rows entry labeled "
+        "'Specialty Drugs' with standard_tier 'preferred_specialty' whose retail "
+        "value joins the per-tier Specialty Drugs prices in tier order with ' / ' "
+        "(e.g. '$5 / 20% coinsurance with a $150 copay maximum / 50% coinsurance "
+        "with a $150 copay maximum'). Specialty prices NEVER go into mail_order, "
+        "and never invent a 'Tier 4' row that the document does not print.\n"
         "AmeriHealth-style naming: 'Preferred Drugs' (brand formulary) → "
         "preferred_brand; 'Non Preferred Drugs' → non_preferred_brand.\n"
         "For combined multi-class rows, the printed tier number decides: Tier 1 → "
@@ -271,7 +323,12 @@ def _build_rx_system_prompt(category: str) -> str:
         "TOP-LEVEL FIELDS:\n"
         "- rx_deductible_<network>: a deductible EXPLICITLY LABELED as applying to "
         "prescription drugs / pharmacy benefits (e.g. 'Prescription Drug deductible: "
-        "$250/person or $500/family'). null when there is none or when it is $0. "
+        "$250/person or $500/family'). Include BOTH individual and family amounts "
+        "when the document lists both — 'Separate Annual Deductible for "
+        "Prescription Drugs: self-only $450, family $900' → '$450 Individual / "
+        "$900 Family'. A deductible limited to some tiers still counts: '$350 per "
+        "year for prescription drugs on Tiers 3, 4 and 5' → '$350 (Tiers 3-5)'. "
+        "null when there is none or when it is $0. "
         "Do NOT copy the plan's overall medical deductible here, even when drug "
         "costs say 'after deductible' — that refers to the medical deductible and "
         "means rx_deductible is null.\n"
@@ -321,7 +378,8 @@ def _build_rx_messages(
 # ("Prescriptions may be filled at an out-of-network pharmacy in emergency
 # situations only...") contain none and must be dropped, not displayed.
 _COST_MARKER = re.compile(
-    r"[\$%]|\d|no charge|not covered|covered in full|deductible|coinsurance|copay",
+    r"[\$%]|\d|no charge|not covered|covered in full|deductible|coinsurance|copay"
+    r"|paid as|\bin[- ]network\b",
     re.IGNORECASE,
 )
 
@@ -333,8 +391,12 @@ def _clean_cost(value: Any) -> str:
     v = value.strip()
     if not v or v.lower().strip(".") in _NOISE_VALUES:
         return ""
-    if v.lower().strip(" .") in ("not covered", "not covered."):
+    # "Not covered", "Not covered (retail and home delivery)", "Not covered."
+    if re.fullmatch(r"not covered\s*(\([^)]*\))?\s*\.?", v, re.IGNORECASE):
         return "Not covered"
+    # Insulin gap-coverage program prices are not tier costs.
+    if re.match(r"^\s*insulin\b", v, re.IGNORECASE):
+        return ""
     if not _COST_MARKER.search(v):
         return ""
     return _strip_rx_suffix(v)
@@ -357,6 +419,80 @@ def _clean_deductible(value: Any) -> str:
 def _dedupe_keep_order(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
+
+# Both channel markers present in one value — the model failed to split a cell.
+_RETAIL_AND_MAIL_MARKERS = re.compile(
+    r"\(\s*retail\s*\).*\(\s*(?:home\s+delivery|mail[\s-]*order)\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# In-cell dual pharmacy-level pricing (the model copies these cells verbatim
+# into in_network_retail; the split happens here, deterministically).
+_LEVEL_TRAILING_MAIL = re.compile(
+    r"\bMail(?:[\s-]*Order)?\s*[-:]\s*(?P<mail>.+)$", re.IGNORECASE | re.DOTALL,
+)
+_LEVEL_SPLIT_PATTERNS = [
+    # 'Retail - Preferred - No Charge Non-Preferred - $10 copayment/prescription'
+    # 'Preferred - $5/prescription Participating - $15/prescription'
+    re.compile(
+        r"^(?:Retail\s*[-:]\s*)?Preferred(?:\s+Participating)?\s*[-:]\s*"
+        r"(?P<pref>.+?)\s+(?:Non-?\s?Preferred|Participating|Standard)\s*[-:]\s*"
+        r"(?P<std>.+)$",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # 'Level A - $10/prescription Level B - $20/prescription'
+    re.compile(
+        r"^Level\s*A\s*[-:]\s*(?P<pref>.+?)\s+Level\s*B\s*[-:]\s*(?P<std>.+)$",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # 'Preferred Pharmacy 30-day supply: You pay $0 Standard Pharmacy 30-day
+    #  supply: You pay $5 ...' (amounts may be dollars, 'No Charge', or a
+    #  coinsurance percentage)
+    re.compile(
+        r"^Preferred\s+Pharmacy\b.*?"
+        r"(?P<pref>\$[\d.,]+|No Charge|\d+(?:\.\d+)?\s*%(?:\s+coinsurance)?)"
+        r".*?\bStandard\s+Pharmacy\b.*?"
+        r"(?P<std>\$[\d.,]+|No Charge|\d+(?:\.\d+)?\s*%(?:\s+coinsurance)?)",
+        re.IGNORECASE | re.DOTALL,
+    ),
+]
+
+
+_MAIL_LABEL_PREFIX = re.compile(r"^\s*Mail(?:[\s-]*Order)?\s*[-:]\s*", re.IGNORECASE)
+
+
+def _clean_mail_cost(value: Any) -> str:
+    """Clean a mail-order cost: drop a verbatim 'Mail -' label prefix and
+    split two-pharmacy-level mail pricing into 'pref / std'."""
+    if not isinstance(value, str):
+        return ""
+    v = _MAIL_LABEL_PREFIX.sub("", value.strip())
+    lvl_pref, lvl_std, _ = _split_pharmacy_levels(v)
+    if lvl_pref and lvl_std:
+        pref, std = _clean_cost(lvl_pref), _clean_cost(lvl_std)
+        if pref and std and pref != std:
+            return f"{pref} / {std}"
+        return pref or std
+    return _clean_cost(v)
+
+
+def _split_pharmacy_levels(value: str) -> tuple[str | None, str | None, str | None]:
+    """Split a verbatim two-pharmacy-level cell into (preferred, standard, mail).
+
+    Returns (None, None, mail_or_None) when the value has no level structure.
+    """
+    if not value:
+        return None, None, None
+    mail: str | None = None
+    m = _LEVEL_TRAILING_MAIL.search(value)
+    if m and not re.match(r"^\s*mail", value, re.IGNORECASE):
+        mail = m.group("mail").strip(" ;,.")
+        value = value[: m.start()].strip(" ;,")
+    for pattern in _LEVEL_SPLIT_PATTERNS:
+        mm = pattern.match(value.strip())
+        if mm:
+            return mm.group("pref").strip(" ;,"), mm.group("std").strip(" ;,"), mail
+    return None, None, mail
 
 _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
@@ -416,11 +552,15 @@ def assemble_rx_fields(category: str, data: dict) -> dict[str, str]:
     oon_status = (data.get("out_of_network_pharmacy") or "").strip()
     merge_preferred = category == "health"
 
-    # Bucket rows by standard tier, preserving document order.
+    # Bucket rows by standard tier, preserving document order. Insulin
+    # gap-coverage program rows (Medicare Part D 'Select Insulin Drugs') are
+    # sub-programs, not drug tiers — exclude them regardless of how the model
+    # classified them.
     slots: dict[str, list[dict]] = {t: [] for t in _STANDARD_TIERS}
     for row in rows:
         tier = row.get("standard_tier")
-        if tier in slots:
+        label = (row.get("label") or "").lower()
+        if tier in slots and "insulin" not in label:
             slots[tier].append(row)
 
     preferred_parts: list[str] = []
@@ -438,10 +578,29 @@ def assemble_rx_fields(category: str, data: dict) -> dict[str, str]:
         for tier in _STANDARD_TIERS:
             retail_vals: list[str] = []
             for row in slots[tier]:
-                retail = _clean_cost(row.get(f"{key}_retail"))
-                mail = _clean_cost(row.get(f"{key}_mail_order"))
+                raw_retail = row.get(f"{key}_retail")
+                retail = _clean_cost(raw_retail)
+                mail = _clean_mail_cost(row.get(f"{key}_mail_order"))
+                # Safety net: the model sometimes copies a whole cell with both
+                # channel prices into *_retail ("$10 (retail) and $25 (home
+                # delivery)"). Split it deterministically.
+                if retail and _RETAIL_AND_MAIL_MARKERS.search(retail):
+                    split_retail, split_mail = _split_retail_mail(retail)
+                    salvaged_mail = split_mail or _extract_home_delivery(retail)
+                    retail = _strip_rx_suffix(_extract_retail_only(split_retail))
+                    if not mail and salvaged_mail:
+                        mail = _strip_rx_suffix(salvaged_mail)
                 if merge_preferred and key == "in_network":
                     pref_retail = _clean_cost(row.get("preferred_pharmacy_retail"))
+                    # Verbatim two-pharmacy-level cell ("Preferred - X
+                    # Non-Preferred - Y Mail - Z") → split here.
+                    if isinstance(raw_retail, str):
+                        lvl_pref, lvl_std, lvl_mail = _split_pharmacy_levels(raw_retail)
+                        if lvl_pref and lvl_std:
+                            pref_retail = _clean_cost(lvl_pref)
+                            retail = _clean_cost(lvl_std)
+                        if lvl_mail and not mail:
+                            mail = _clean_mail_cost(lvl_mail)
                     if pref_retail:
                         if display == "In-Network" and tier in _TIER_SUFFIX:
                             label = (row.get("label") or "").strip()
@@ -453,7 +612,7 @@ def assemble_rx_fields(category: str, data: dict) -> dict[str, str]:
                         elif not retail:
                             retail = pref_retail
                     if not mail:
-                        mail = _clean_cost(row.get("preferred_pharmacy_mail_order"))
+                        mail = _clean_mail_cost(row.get("preferred_pharmacy_mail_order"))
                 if retail:
                     retail_vals.append(retail)
                     label = (row.get("label") or "").strip()

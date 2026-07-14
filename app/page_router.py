@@ -93,6 +93,7 @@ _HEALTH_SERVICE_ROW_PHRASES: list[str] = [
     "hospital stay", "facility fee", "urgent care", "emergency room",
     "outpatient surgery", "childbirth", "imaging (ct",
     "advanced diagnostic imaging", "ambulatory surg", "physician/surgeon",
+    "office visit", "primary care physician", "specialist office",
 ]
 
 # Markers of the SBC "Coverage Examples" page (sample-cost illustrations,
@@ -118,7 +119,7 @@ _RX_COST_MARKERS: tuple[str, ...] = ("$", "coinsurance", "copay", "no charge")
 
 def select_rx_pages(
     docling_pages: list[dict[str, Any]],
-    top_n: int = 4,
+    top_n: int = 5,
 ) -> list[int]:
     """Return 1-based page numbers likely to contain the pharmacy cost table.
 
@@ -170,11 +171,15 @@ def select_pages(
         score += 0.5 * sum(1.0 for kw in _NARRATIVE_KEYWORDS if kw in text)
 
         if category in _HEALTH_CATEGORIES:
-            score += 2.0 * sum(
-                1.0 for phrase in _HEALTH_SERVICE_ROW_PHRASES if phrase in text
-            )
+            # Coverage-example pages name many services ("specialist office
+            # visits", "childbirth") without containing plan values — they get
+            # the penalty and never the service-row bonus.
             if any(marker in text for marker in _COVERAGE_EXAMPLE_MARKERS):
                 score -= 10.0
+            else:
+                score += 2.0 * sum(
+                    1.0 for phrase in _HEALTH_SERVICE_ROW_PHRASES if phrase in text
+                )
 
         scored.append((page_num, score))
 

@@ -16,6 +16,25 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
 _IMAGE_BASED_CHARS_PER_PAGE_THRESHOLD = 100
 
 
+def _looks_image_based(char_counts: list[int]) -> bool:
+    """Classify from per-page extractable character counts.
+
+    A PDF is image-based when the AVERAGE page has little text — OR when MOST
+    pages have little text. The second test catches mixed documents (e.g. a
+    scanned SBC with one text-based cover/disclaimer page) whose average is
+    inflated by the few text pages while the benefit tables are pure images.
+    """
+    if not char_counts:
+        return True
+    avg = sum(char_counts) / len(char_counts)
+    if avg < _IMAGE_BASED_CHARS_PER_PAGE_THRESHOLD:
+        return True
+    sparse_pages = sum(
+        1 for c in char_counts if c < _IMAGE_BASED_CHARS_PER_PAGE_THRESHOLD
+    )
+    return sparse_pages > len(char_counts) / 2
+
+
 def is_image_based_pdf(pdf_bytes: bytes) -> bool:
     """Return True if the PDF appears to be image-based (scanned, no text layer).
 
@@ -31,16 +50,15 @@ def is_image_based_pdf(pdf_bytes: bytes) -> bool:
         if not reader.pages:
             return True  # empty / unreadable — let docling decide
 
-        total_chars = sum(
+        char_counts = [
             len((page.extract_text() or "").strip())
             for page in reader.pages
-        )
-        avg_chars_per_page = total_chars / len(reader.pages)
-        result = avg_chars_per_page < _IMAGE_BASED_CHARS_PER_PAGE_THRESHOLD
+        ]
+        result = _looks_image_based(char_counts)
         logger.debug(
             "is_image_based_pdf: classification=%s avg_chars_per_page=%.1f",
             "image-based" if result else "text-based",
-            avg_chars_per_page,
+            sum(char_counts) / len(char_counts),
         )
         return result
     except Exception:
