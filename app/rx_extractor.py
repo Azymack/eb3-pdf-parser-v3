@@ -198,9 +198,10 @@ _RX_SYSTEM_PROMPT_HEALTH_NETWORKS = (
     "Pharmacy 30-day supply: You pay $5'. Put a separately printed Mail price "
     "('Mail - $30 copayment/prescription') into in_network_mail_order, and "
     "leave preferred_pharmacy_* null — the two levels are separated later. "
-    "NEVER keep only one level's price and NEVER emit two drug_rows entries "
-    "for one printed row. (Level markers inside the cell are different from "
-    "Preferred/Non-Preferred DRUG tiers in the row label.)\n"
+    "NEVER keep only one level's price, and never split one printed row's two "
+    "pharmacy levels into two drug_rows entries. (Level markers inside the "
+    "cell are different from Preferred/Non-Preferred DRUG tiers in the row "
+    "label.)\n"
     "OON PAID AS IN-NETWORK: when the out-of-network pharmacy column says the "
     "benefit is paid at the in-network level (e.g. 'Paid As In-Network'), record "
     "that phrase as the out_of_network_retail value — it is a real benefit, "
@@ -226,7 +227,10 @@ def _build_rx_system_prompt(category: str) -> str:
         "PRESCRIPTION DRUG (pharmacy) benefit structure from this health insurance "
         "plan document. Respond with ONLY valid JSON matching the required schema.\n\n"
         "DRUG ROWS: output one drug_rows entry for EVERY printed drug tier row of the "
-        "pharmacy cost-share section, in document order. Pharmacy sections often "
+        "pharmacy cost-share section, in document order — including rows that share "
+        "the same label: a 'Generic drugs' row priced $3 and a second 'Generic "
+        "drugs' row priced 49% coinsurance are TWO entries; never merge or drop "
+        "the second one. Pharmacy sections often "
         "continue across pages — scan ALL provided pages and include every row.\n\n"
         "label: the row's tier label exactly as printed. Examples: 'Generic drugs', "
         "'Tier 2', 'Level 1: Preferred generic drugs and certain lower cost preferred "
@@ -262,8 +266,11 @@ def _build_rx_system_prompt(category: str) -> str:
         "'Specialty Drugs' with standard_tier 'preferred_specialty' whose retail "
         "value joins the per-tier Specialty Drugs prices in tier order with ' / ' "
         "(e.g. '$5 / 20% coinsurance with a $150 copay maximum / 50% coinsurance "
-        "with a $150 copay maximum'). Specialty prices NEVER go into mail_order, "
-        "and never invent a 'Tier 4' row that the document does not print.\n"
+        "with a $150 copay maximum'). This joined 'Specialty Drugs' entry is "
+        "REQUIRED whenever tier cells embed specialty prices — emit it even "
+        "though it is not a printed row of its own. Specialty prices NEVER go "
+        "into mail_order, and never invent a 'Tier 4' row that the document "
+        "does not print.\n"
         "AmeriHealth-style naming: 'Preferred Drugs' (brand formulary) → "
         "preferred_brand; 'Non Preferred Drugs' → non_preferred_brand.\n"
         "For combined multi-class rows, the printed tier number decides: Tier 1 → "
@@ -384,11 +391,16 @@ _COST_MARKER = re.compile(
 )
 
 
+def _normalize_dashes(value: str) -> str:
+    """En/em dashes → hyphens so the level/mail patterns match all documents."""
+    return value.replace("–", "-").replace("—", "-")
+
+
 def _clean_cost(value: Any) -> str:
     """Normalize a single cost cell value from the VLM."""
     if not isinstance(value, str):
         return ""
-    v = value.strip()
+    v = _normalize_dashes(value).strip()
     if not v or v.lower().strip(".") in _NOISE_VALUES:
         return ""
     # "Not covered", "Not covered (retail and home delivery)", "Not covered."
@@ -399,6 +411,24 @@ def _clean_cost(value: Any) -> str:
         return ""
     if not _COST_MARKER.search(v):
         return ""
+    # Single-level label prefix left over from a verbatim cell copy:
+    # "Retail - Participating - $15/prescription" -> "$15/prescription"
+    v = re.sub(
+        r"^Retail\s*-\s*(?:Preferred(?:\s+Participating)?|Participating|"
+        r"Non-?\s?Preferred|Standard)\s*-\s*",
+        "",
+        v,
+        flags=re.IGNORECASE,
+    )
+    # Lone channel/supply qualifiers are noise once the value is channel-routed:
+    # "50% coinsurance (retail)" -> "50% coinsurance";
+    # "20% coinsurance for up to a 30 day supply" -> "20% coinsurance".
+    # (Cells with BOTH retail and mail markers are split by the caller first.)
+    if not _RETAIL_AND_MAIL_MARKERS.search(v):
+        v = re.sub(r"\s*\(\s*retail(?:\s+only)?\s*\)\s*$", "", v, flags=re.IGNORECASE)
+    v = re.sub(
+        r"\s+for up to a \d+[\s-]*day supply\.?$", "", v, flags=re.IGNORECASE,
+    ).strip()
     return _strip_rx_suffix(v)
 
 
@@ -466,7 +496,7 @@ def _clean_mail_cost(value: Any) -> str:
     split two-pharmacy-level mail pricing into 'pref / std'."""
     if not isinstance(value, str):
         return ""
-    v = _MAIL_LABEL_PREFIX.sub("", value.strip())
+    v = _MAIL_LABEL_PREFIX.sub("", _normalize_dashes(value).strip())
     lvl_pref, lvl_std, _ = _split_pharmacy_levels(v)
     if lvl_pref and lvl_std:
         pref, std = _clean_cost(lvl_pref), _clean_cost(lvl_std)
@@ -483,6 +513,7 @@ def _split_pharmacy_levels(value: str) -> tuple[str | None, str | None, str | No
     """
     if not value:
         return None, None, None
+    value = _normalize_dashes(value)
     mail: str | None = None
     m = _LEVEL_TRAILING_MAIL.search(value)
     if m and not re.match(r"^\s*mail", value, re.IGNORECASE):
@@ -611,8 +642,13 @@ def assemble_rx_fields(category: str, data: dict) -> dict[str, str]:
                             retail = f"{pref_retail} / {retail}"
                         elif not retail:
                             retail = pref_retail
-                    if not mail:
-                        mail = _clean_mail_cost(row.get("preferred_pharmacy_mail_order"))
+                    pref_mail = _clean_mail_cost(
+                        row.get("preferred_pharmacy_mail_order")
+                    )
+                    if pref_mail and mail and pref_mail != mail:
+                        mail = f"{pref_mail} / {mail}"
+                    elif pref_mail and not mail:
+                        mail = pref_mail
                 if retail:
                     retail_vals.append(retail)
                     label = (row.get("label") or "").strip()

@@ -94,6 +94,9 @@ _HEALTH_SERVICE_ROW_PHRASES: list[str] = [
     "outpatient surgery", "childbirth", "imaging (ct",
     "advanced diagnostic imaging", "ambulatory surg", "physician/surgeon",
     "office visit", "primary care physician", "specialist office",
+    # SBC "Important Questions" page — holds the deductible and
+    # out-of-pocket limit answers, but few service keywords.
+    "out-of-pocket limit", "overall deductible",
 ]
 
 # Markers of the SBC "Coverage Examples" page (sample-cost illustrations,

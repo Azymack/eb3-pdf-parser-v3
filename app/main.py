@@ -53,6 +53,13 @@ def _mirror_ct_into_major_diagnostics(
             fields[md] = fields.get(ct)
 
 
+# Placeholder phrases the VLM occasionally invents instead of returning null.
+_PLACEHOLDER_VALUES: frozenset[str] = frozenset({
+    "not specified", "no specific value provided", "not provided",
+    "not mentioned", "unknown", "see document",
+})
+
+
 def _nulls_to_empty(fields: dict) -> dict[str, str]:
     """Coerce all field values to str for API output.
 
@@ -69,7 +76,7 @@ def _nulls_to_empty(fields: dict) -> dict[str, str]:
         if v is None:
             result[k] = ""
         elif isinstance(v, str):
-            result[k] = v
+            result[k] = "" if v.strip().lower() in _PLACEHOLDER_VALUES else v
         elif isinstance(v, dict):
             parts = [f"{sk}: {sv}" for sk, sv in v.items() if sv is not None]
             result[k] = " / ".join(parts)
