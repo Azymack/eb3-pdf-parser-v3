@@ -2,7 +2,7 @@ import io
 import logging
 
 import httpx
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 from .config import get_settings
 
@@ -14,6 +14,42 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
 # PDFs with fewer than this many average extractable characters per page are
 # classified as image-based (scanned) and sent to docling with ocr_mode=force.
 _IMAGE_BASED_CHARS_PER_PAGE_THRESHOLD = 100
+
+
+def slice_pdf_to_max_pages(pdf_bytes: bytes, max_pages: int) -> tuple[bytes, int, int]:
+    """Keep only the first ``max_pages`` pages of a PDF.
+
+    Returns ``(possibly_sliced_bytes, original_page_count, kept_page_count)``.
+    When ``max_pages`` is <= 0 or the PDF already fits, the original bytes are
+    returned unchanged. On read/write failure, returns the original bytes so
+    the pipeline can still try docling.
+    """
+    if max_pages <= 0:
+        return pdf_bytes, 0, 0
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        original_count = len(reader.pages)
+        if original_count <= max_pages:
+            return pdf_bytes, original_count, original_count
+
+        writer = PdfWriter()
+        for i in range(max_pages):
+            writer.add_page(reader.pages[i])
+        out = io.BytesIO()
+        writer.write(out)
+        sliced = out.getvalue()
+        logger.info(
+            "slice_pdf_to_max_pages: truncated PDF from %d to %d pages",
+            original_count,
+            max_pages,
+        )
+        return sliced, original_count, max_pages
+    except Exception:
+        logger.warning(
+            "slice_pdf_to_max_pages: failed to truncate PDF; using original bytes",
+            exc_info=True,
+        )
+        return pdf_bytes, 0, 0
 
 
 def _looks_image_based(char_counts: list[int]) -> bool:

@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     VALID_API_KEYS: str = "eb3-key-1,eb3-key-2"
 
     PAGE_ROUTING_TOP_N: int = 5
+    # Cap PDF length before docling/OCR/VLM so large uploads do not overload the pipeline.
+    # Set to 0 to disable truncation.
+    MAX_PDF_PAGES: int = 13
     REQUEST_TIMEOUT_SECONDS: int = 120
     MAX_FILE_SIZE_MB: int = 50
 

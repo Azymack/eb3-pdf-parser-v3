@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from .auth import verify_token
 from .config import get_settings
-from .docling_client import convert_pdf
+from .docling_client import convert_pdf, slice_pdf_to_max_pages
 from .image_renderer import render_pages
 from .page_router import select_pages, select_rx_pages
 from .post_process import apply_post_processing, vlm_field_names
@@ -214,6 +214,22 @@ async def _run_pipeline(
     settings,
 ) -> ExtractionResponse:
     pipeline_start = time.monotonic()
+
+    # Cap page count early so docling, OCR, page routing, and image rendering
+    # never see more than MAX_PDF_PAGES (default 13). Benefit tables almost
+    # always sit in the front of SBCs; trailing pages are mostly legal text.
+    pdf_bytes, original_pages, kept_pages = slice_pdf_to_max_pages(
+        pdf_bytes, settings.MAX_PDF_PAGES,
+    )
+    if original_pages > kept_pages > 0:
+        logger.info(
+            "pipeline: PDF truncated before processing",
+            extra={
+                "filename": filename,
+                "original_pages": original_pages,
+                "kept_pages": kept_pages,
+            },
+        )
 
     # ── Stage 1: docling PDF→markdown ────────────────────────────────────────
     logger.info("pipeline[1/4]: docling conversion — start")
