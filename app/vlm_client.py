@@ -119,6 +119,51 @@ _HEALTH_FIELD_DEFINITIONS_PROMPT = (
 )
 
 
+# Block 4 — dental class-grouped benefit tables.
+_DENTAL_FIELD_DEFINITIONS_PROMPT = (
+    "\n\nDENTAL CLASS TABLES: benefit summaries often group procedures under "
+    "coverage classes with ONE percentage per class (e.g. 'Class I - "
+    "Diagnostic/Preventive Services: 100%', 'Class II - Basic Services: 80%', "
+    "'Class III - Major Services: 50%'), listing many procedures under each "
+    "class heading while printing the percentage only once. The class "
+    "percentage applies to EVERY procedure listed under that class — never "
+    "leave a listed procedure's field empty just because the percentage is not "
+    "printed on its own row. The percentage may be printed beside ANY row in "
+    "the middle of the class (e.g. beside 'Nonsurgical Periodontics'); every "
+    "procedure from one class heading down to the NEXT class heading belongs "
+    "to that class, including rows printed AFTER the percentage (e.g. "
+    "'Complex Oral Surgery' listed after the 80% row but before 'Class III' "
+    "is still Class II → 80%). Common groupings:\n"
+    "- Class I (Diagnostic/Preventive): Exams, Bitewing X-rays and All Other "
+    "X-rays (→ X-Rays), Cleanings, Fluoride, Sealants, Space Maintainers, "
+    "Palliative Treatment.\n"
+    "- Class II (Basic): Basic Restorative (→ Fillings), Simple Extractions, "
+    "Endodontics (→ Root Canal), Nonsurgical/Surgical Periodontics "
+    "(→ Periodontal Gum Disease), Complex Oral Surgery (→ Oral Surgery), "
+    "Posterior Resins.\n"
+    "- Class III (Major): Inlays/Onlays/Crowns (→ Crowns), Prosthetics "
+    "(→ BOTH Dentures and Bridges), Implants.\n"
+    "When one percentage column applies to both networks (or separate "
+    "In-Network/Non-Network columns show the same value), fill In-Network and "
+    "Out-of-Network fields alike. Use null only for procedures the document "
+    "does not cover anywhere."
+)
+
+# Block 5 — vision lens field semantics.
+_VISION_FIELD_DEFINITIONS_PROMPT = (
+    "\n\nVISION LENS FIELDS: 'Single Vision Lens', 'Lined Bi-Focal Lens', "
+    "'Lined Tri-Focal Lens', and 'Lenticular Lens' are the member cost for the "
+    "STANDARD lens of that type, from the lens MATERIALS row. When one "
+    "materials row prices all standard lens types together — e.g. 'Clear "
+    "plastic single-vision, lined bifocal, trifocal or lenticular lenses (any "
+    "size or Rx): $0' — give ALL of these lens fields that SAME value ('$0'), "
+    "including Single Vision Lens. Do NOT use the separate 'Eyeglass lenses' "
+    "CO-PAYMENT row for any single lens type, and NEVER use lens add-on rows "
+    "(tinting, coatings, polycarbonate, progressive upgrades, "
+    "scratch-protection plans) as the value for these fields."
+)
+
+
 def _build_system_prompt(category: str, display_category: str) -> str:
     """Compose a category-appropriate system prompt from the relevant blocks."""
     parts = [_BASE_PROMPT.format(display_category=display_category)]
@@ -126,6 +171,10 @@ def _build_system_prompt(category: str, display_category: str) -> str:
         parts.append(_SINGLE_COLUMN_PROMPT)
     if category in _HEALTH_CATEGORIES:
         parts.append(_HEALTH_FIELD_DEFINITIONS_PROMPT)
+    if category == "dental":
+        parts.append(_DENTAL_FIELD_DEFINITIONS_PROMPT)
+    if category == "vision":
+        parts.append(_VISION_FIELD_DEFINITIONS_PROMPT)
     return "".join(parts)
 
 

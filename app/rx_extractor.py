@@ -229,7 +229,9 @@ def _build_rx_system_prompt(category: str) -> str:
         "DRUG ROWS: output one drug_rows entry for EVERY printed drug tier row of the "
         "pharmacy cost-share section, in document order — including rows that share "
         "the same label: a 'Generic drugs' row priced $3 and a second 'Generic "
-        "drugs' row priced 49% coinsurance are TWO entries; never merge or drop "
+        "drugs' row priced 49% coinsurance are TWO entries (generic), and two "
+        "'Specialty drugs' rows priced 20% and 40% are TWO entries "
+        "(preferred_specialty and non_preferred_specialty); never merge or drop "
         "the second one. Pharmacy sections often "
         "continue across pages — scan ALL provided pages and include every row.\n\n"
         "label: the row's tier label exactly as printed. Examples: 'Generic drugs', "
@@ -335,6 +337,11 @@ def _build_rx_system_prompt(category: str) -> str:
         "Prescription Drugs: self-only $450, family $900' → '$450 Individual / "
         "$900 Family'. A deductible limited to some tiers still counts: '$350 per "
         "year for prescription drugs on Tiers 3, 4 and 5' → '$350 (Tiers 3-5)'. "
+        "SBCs often state it in the 'Important Questions' row 'Are there other "
+        "deductibles for specific services?' — e.g. 'Yes. Prescription drugs — "
+        "$100 Individual / $200 Family' → '$100 Individual / $200 Family'. When "
+        "that row says 'No' or lists only non-drug deductibles (e.g. 'ER $500'), "
+        "rx_deductible is null. "
         "null when there is none or when it is $0. "
         "Do NOT copy the plan's overall medical deductible here, even when drug "
         "costs say 'after deductible' — that refers to the medical deductible and "
@@ -694,6 +701,41 @@ def assemble_rx_fields(category: str, data: dict) -> dict[str, str]:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _parse_model_json(raw: str) -> dict:
+    """Parse model output tolerantly.
+
+    The vLLM server does not reliably enforce guided_json — outputs have been
+    observed with code fences, JavaScript-style // comments, and trailing
+    commas. Strict parse first; then repair and retry.
+    """
+    cleaned = (
+        raw.strip()
+        .removeprefix("```json").removeprefix("```")
+        .removesuffix("```").strip()
+    )
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    # Strip // comments — only where the preceding quote count is even (i.e.
+    # outside a string), so URLs like "https://..." inside values survive.
+    lines = []
+    for line in cleaned.splitlines():
+        search_from = 0
+        while True:
+            pos = line.find("//", search_from)
+            if pos == -1:
+                break
+            if line.count('"', 0, pos) % 2 == 0:
+                line = line[:pos].rstrip()
+                break
+            search_from = pos + 2
+        lines.append(line)
+    repaired = "\n".join(lines)
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)  # trailing commas
+    return json.loads(repaired)
+
+
 async def extract_rx_fields(
     category: str,
     page_markdowns: list[dict],
@@ -709,18 +751,24 @@ async def extract_rx_fields(
 
     logger.info("rx_extractor: starting structured RX extraction",
                 extra={"category": category})
-    raw = await _chat_completion(messages, extra_body={"guided_json": schema})
-    cleaned = (
-        raw.strip()
-        .removeprefix("```json").removeprefix("```")
-        .removesuffix("```").strip()
-    )
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        logger.error("rx_extractor: JSON parse failed",
-                     extra={"content_preview": cleaned[:300]})
-        raise ValueError(f"RX extraction returned unparseable content: {exc}") from exc
+    data: dict | None = None
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        raw = await _chat_completion(messages, extra_body={"guided_json": schema})
+        try:
+            data = _parse_model_json(raw)
+            break
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            logger.warning(
+                "rx_extractor: JSON parse failed (attempt %d/2)",
+                attempt,
+                extra={"content_preview": raw[:300]},
+            )
+    if data is None:
+        raise ValueError(
+            f"RX extraction returned unparseable content: {last_exc}"
+        ) from last_exc
 
     fields = assemble_rx_fields(category, data)
     logger.info(

@@ -94,6 +94,10 @@ _HEALTH_SERVICE_ROW_PHRASES: list[str] = [
     "outpatient surgery", "childbirth", "imaging (ct",
     "advanced diagnostic imaging", "ambulatory surg", "physician/surgeon",
     "office visit", "primary care physician", "specialist office",
+    # The real maternity benefit row ("Childbirth/delivery facility services")
+    # — scores in addition to "childbirth" so benefit pages with the actual
+    # row beat duplicated/translated summary pages.
+    "delivery facility",
     # SBC "Important Questions" page — holds the deductible and
     # out-of-pocket limit answers, but few service keywords.
     "out-of-pocket limit", "overall deductible",
@@ -140,6 +144,10 @@ def select_rx_pages(
         )
         if has_tier_words and any(m in text for m in _RX_COST_MARKERS):
             score += 6.0
+        # SBC "Important Questions" row 'Are there other deductibles for
+        # specific services?' often states the prescription drug deductible.
+        if "other deductibles" in text and "prescription" in text:
+            score += 4.0
         scored.append((page_num, score))
 
     scored.sort(key=lambda x: (-x[1], x[0]))

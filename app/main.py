@@ -56,7 +56,7 @@ def _mirror_ct_into_major_diagnostics(
 # Placeholder phrases the VLM occasionally invents instead of returning null.
 _PLACEHOLDER_VALUES: frozenset[str] = frozenset({
     "not specified", "no specific value provided", "not provided",
-    "not mentioned", "unknown", "see document",
+    "not mentioned", "unknown", "see document", "null",
 })
 
 
