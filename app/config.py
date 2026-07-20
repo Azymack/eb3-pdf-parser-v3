@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # Replace with a real key store (hashed comparison, per-key rate limiting).
     VALID_API_KEYS: str = "eb3-key-1,eb3-key-2"
 
-    PAGE_ROUTING_TOP_N: int = 5
+    PAGE_ROUTING_TOP_N: int = 8
     # Cap PDF length before docling/OCR/VLM so large uploads do not overload the pipeline.
     # Set to 0 to disable truncation.
     MAX_PDF_PAGES: int = 13

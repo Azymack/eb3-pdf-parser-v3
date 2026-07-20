@@ -224,7 +224,15 @@ def select_pages(
         ]
         selected_set |= set(table_pages)
 
-    selected_set.add(1)
+    # The benefit-cost table always starts within the first few pages of an
+    # SBC / Benefit Summary (right after the cover/header); noise sections
+    # that outscore it on keywords (Coverage Examples, Glossary of Terms,
+    # legal/language notices) always come later. Guaranteeing the first 5
+    # pages sidesteps having to keep discovering and patching new noise-page
+    # types one at a time.
+    selected_set |= {
+        page["page_number"] for page in docling_pages if page["page_number"] <= 5
+    }
     selected = sorted(selected_set)
 
     logger.info(
