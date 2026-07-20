@@ -701,6 +701,82 @@ def assemble_rx_fields(category: str, data: dict) -> dict[str, str]:
 # Entry point
 # ---------------------------------------------------------------------------
 
+# Dual-pharmacy-level cell as it appears in docling markdown (BCBS TX/OK):
+#   Generic drugs (Preferred) | Retail - Preferred - No Charge
+#   Non-Preferred - $10 copayment/prescription Mail - No Charge | ...
+_DUAL_LEVEL_CELL = re.compile(
+    r"(?P<kind>Generic|Brand|Specialty)\s+drugs?\s*\(\s*"
+    r"(?P<qual>Preferred|Non-?\s?preferred)\s*\)?"
+    r"[^|]{0,80}?\|\s*Retail\s*-\s*Preferred(?:\s+Participating)?\s*-\s*"
+    r"(?P<pref>[^|]+?)\s*(?:Non-?\s?Preferred|Participating)\s*-\s*"
+    r"(?P<std>[^|]+?)"
+    r"(?:\s*Mail\s*-\s*(?P<mail>[^|]+?))?\s*\|",
+    re.IGNORECASE,
+)
+
+
+def _label_level_key(label: str) -> tuple[str, str] | None:
+    km = re.search(r"(generic|brand|specialty)", label, re.IGNORECASE)
+    if not km:
+        return None
+    if re.search(r"non[-\s]*preferred", label, re.IGNORECASE):
+        return km.group(1).lower(), "nonpreferred"
+    if re.search(r"preferred", label, re.IGNORECASE):
+        return km.group(1).lower(), "preferred"
+    return None
+
+
+def _apply_dual_level_salvage(data: dict, page_markdowns: list[dict]) -> None:
+    """Deterministically repair rows where the model dropped a pharmacy-level price.
+
+    The model's handling of 'Retail - Preferred - X Non-Preferred - Y' cells is
+    unstable — near-identical documents flip between keeping both prices and
+    keeping only the first. The prices are recoverable verbatim from the page
+    markdown, so when a drug row matches a dual-level cell and the model did
+    not capture two distinct level prices, both are restored from the source.
+    """
+    text = _normalize_dashes(
+        "\n".join(re.sub(r"\s+", " ", p.get("markdown", "")) for p in page_markdowns)
+    )
+    salvage: dict[tuple[str, str], tuple[str, str, str | None]] = {}
+    for m in _DUAL_LEVEL_CELL.finditer(text):
+        qual = (
+            "nonpreferred"
+            if re.search(r"non", m.group("qual"), re.IGNORECASE)
+            else "preferred"
+        )
+        salvage[(m.group("kind").lower(), qual)] = (
+            m.group("pref").strip(),
+            m.group("std").strip(),
+            (m.group("mail") or "").strip() or None,
+        )
+    if not salvage:
+        return
+    for row in data.get("drug_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        key = _label_level_key(row.get("label") or "")
+        if key is None or key not in salvage:
+            continue
+        pref, std, mail = salvage[key]
+        cur_pref = row.get("preferred_pharmacy_retail")
+        cur_inn = row.get("in_network_retail")
+        has_both = (
+            isinstance(cur_pref, str) and cur_pref.strip()
+            and isinstance(cur_inn, str) and cur_inn.strip()
+            and cur_pref.strip() != cur_inn.strip()
+        ) or (
+            isinstance(cur_inn, str)
+            and _split_pharmacy_levels(cur_inn)[0] is not None
+        )
+        if not has_both:
+            row["preferred_pharmacy_retail"] = pref
+            row["in_network_retail"] = std
+        cur_mail = row.get("in_network_mail_order")
+        if mail and not (isinstance(cur_mail, str) and cur_mail.strip()):
+            row["in_network_mail_order"] = mail
+
+
 def _parse_model_json(raw: str) -> dict:
     """Parse model output tolerantly.
 
@@ -769,6 +845,9 @@ async def extract_rx_fields(
         raise ValueError(
             f"RX extraction returned unparseable content: {last_exc}"
         ) from last_exc
+
+    if category == "health":
+        _apply_dual_level_salvage(data, page_markdowns)
 
     fields = assemble_rx_fields(category, data)
     logger.info(

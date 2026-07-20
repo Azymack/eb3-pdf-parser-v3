@@ -101,6 +101,14 @@ _HEALTH_SERVICE_ROW_PHRASES: list[str] = [
     # SBC "Important Questions" page — holds the deductible and
     # out-of-pocket limit answers, but few service keywords.
     "out-of-pocket limit", "overall deductible",
+    # UnitedHealthcare "Benefit Summary" format (as opposed to SBC): same
+    # four benefits, different row wording/word order, spread one section
+    # per page across many pages. Without these, "Surgery - Outpatient",
+    # "Hospital - Inpatient Stay", "Major Diagnostic and Imaging - Outpatient"
+    # and "Pregnancy - Maternity Services" never match any phrase above and
+    # lose to front-matter pages dense in generic keywords.
+    "surgery - outpatient", "hospital - inpatient stay",
+    "major diagnostic and imaging", "maternity services",
 ]
 
 # Markers of the SBC "Coverage Examples" page (sample-cost illustrations,
@@ -111,6 +119,16 @@ _COVERAGE_EXAMPLE_MARKERS: list[str] = [
 ]
 
 _HEALTH_CATEGORIES: frozenset[str] = frozenset({"health", "health_3tier"})
+
+# UnitedHealthcare "Benefit Summary" format (Choice/Choice Plus plans, distinct
+# from the federal SBC template): the entire "Copays ($) and Coinsurance (%)
+# for Covered Health Care Services" table repeats this exact running header on
+# EVERY one of its pages — 6 to 9 consecutive pages is typical — while it never
+# appears on the cover, pharmacy, coverage-example, or exclusions pages. No
+# amount of keyword-score tuning lets these sparse (2-4 row) pages consistently
+# outrank keyword-dense front matter within a small top_n budget, so instead
+# of scoring them, every page carrying this marker is unconditionally included.
+_BENEFIT_TABLE_CONTINUATION_MARKER = "what you pay for services"
 
 
 # RX-specific routing: the pharmacy table can sit on a page that scores poorly
@@ -196,12 +214,18 @@ def select_pages(
 
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    selected = [pnum for pnum, _ in scored[:top_n]]
+    selected_set = {pnum for pnum, _ in scored[:top_n]}
 
-    if 1 not in selected:
-        selected.append(1)
+    table_pages: list[int] = []
+    if category in _HEALTH_CATEGORIES:
+        table_pages = [
+            page["page_number"] for page in docling_pages
+            if _BENEFIT_TABLE_CONTINUATION_MARKER in page.get("markdown", "").lower()
+        ]
+        selected_set |= set(table_pages)
 
-    selected.sort()
+    selected_set.add(1)
+    selected = sorted(selected_set)
 
     logger.info(
         "page_router: pages selected",
@@ -209,6 +233,7 @@ def select_pages(
             "category": category,
             "top_n": top_n,
             "all_scores": [(pnum, round(s, 2)) for pnum, s in scored],
+            "benefit_table_pages": table_pages,
             "selected": selected,
         },
     )
