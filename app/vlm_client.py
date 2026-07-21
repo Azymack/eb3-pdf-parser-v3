@@ -119,6 +119,34 @@ _HEALTH_FIELD_DEFINITIONS_PROMPT = (
 )
 
 
+# Block 3b — health_3tier provider-level column mapping.
+# The main call previously had NO definition of what the three field prefixes
+# mean, so the model guessed — often copying the first (cheapest) column into
+# the In-Network fields and leaving the middle column unused.
+_HEALTH_3TIER_NETWORK_PROMPT = (
+    "\n\nTHREE PROVIDER LEVELS: this plan type prices services at THREE "
+    "provider levels, shown as three cost columns. Documents name the levels "
+    "differently — 'Designated Network / Non-Designated Network / "
+    "Out-of-Network', 'In-Network Tier 1 / In-Network Tier 2 / Out-of-Network "
+    "Provider', 'Tier 1 - <brand> Network / Tier 2 - <brand> Network / "
+    "Non-Network Provider'. Map the columns by POSITION and cost level, never "
+    "by name:\n"
+    "- FIRST cost column (cheapest level — 'You will pay the least', Tier 1, "
+    "Designated) → the 'Designated Network ...' fields.\n"
+    "- MIDDLE cost column (Tier 2, Non-Designated, standard network — 'You "
+    "will pay more') → the 'In-Network ...' fields.\n"
+    "- LAST cost column ('You will pay the most', Out-of-Network, "
+    "Non-Network, Non-Participating) → the 'Out-of-Network ...' fields.\n"
+    "NEVER copy the first column's value into an 'In-Network ...' field when "
+    "the middle column prints its own value — each column fills only its own "
+    "fields, for EVERY benefit row (deductible, out-of-pocket limit, "
+    "coinsurance, office visits, urgent care, surgery, imaging, delivery). "
+    "When a deductible or out-of-pocket limit is stated ONCE covering the "
+    "first two levels together (e.g. 'For Tier 1 and Tier 2 Participating "
+    "providers $6,000 person / $12,000 family'), fill BOTH the Designated "
+    "Network and In-Network deductible/OOP fields with that same amount."
+)
+
 # Block 4 — dental class-grouped benefit tables.
 _DENTAL_FIELD_DEFINITIONS_PROMPT = (
     "\n\nDENTAL CLASS TABLES: benefit summaries often group procedures under "
@@ -171,6 +199,8 @@ def _build_system_prompt(category: str, display_category: str) -> str:
         parts.append(_SINGLE_COLUMN_PROMPT)
     if category in _HEALTH_CATEGORIES:
         parts.append(_HEALTH_FIELD_DEFINITIONS_PROMPT)
+    if category == "health_3tier":
+        parts.append(_HEALTH_3TIER_NETWORK_PROMPT)
     if category == "dental":
         parts.append(_DENTAL_FIELD_DEFINITIONS_PROMPT)
     if category == "vision":

@@ -408,6 +408,9 @@ def _clean_cost(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     v = _normalize_dashes(value).strip()
+    # Multi-line cell values ("Generic - T1A: $3\nGeneric - T1: $10") render
+    # as one field — join lines the same way multiple values are joined.
+    v = re.sub(r"\s*\n\s*", " / ", v)
     if not v or v.lower().strip(".") in _NOISE_VALUES:
         return ""
     # "Not covered", "Not covered (retail and home delivery)", "Not covered."
@@ -466,7 +469,8 @@ _RETAIL_AND_MAIL_MARKERS = re.compile(
 # In-cell dual pharmacy-level pricing (the model copies these cells verbatim
 # into in_network_retail; the split happens here, deterministically).
 _LEVEL_TRAILING_MAIL = re.compile(
-    r"\bMail(?:[\s-]*Order)?\s*[-:]\s*(?P<mail>.+)$", re.IGNORECASE | re.DOTALL,
+    r"\bMail(?:[\s-]*Order|\s+Service)?\s*[-:]\s*(?P<mail>.+)$",
+    re.IGNORECASE | re.DOTALL,
 )
 _LEVEL_SPLIT_PATTERNS = [
     # 'Retail - Preferred - No Charge Non-Preferred - $10 copayment/prescription'
@@ -478,8 +482,10 @@ _LEVEL_SPLIT_PATTERNS = [
         re.IGNORECASE | re.DOTALL,
     ),
     # 'Level A - $10/prescription Level B - $20/prescription'
+    # 'Retail: Level A: $20/prescription Level B: $25/prescription'
     re.compile(
-        r"^Level\s*A\s*[-:]\s*(?P<pref>.+?)\s+Level\s*B\s*[-:]\s*(?P<std>.+)$",
+        r"^(?:Retail\s*[-:]\s*)?Level\s*A\s*[-:]\s*(?P<pref>.+?)"
+        r"\s+Level\s*B\s*[-:]\s*(?P<std>.+)$",
         re.IGNORECASE | re.DOTALL,
     ),
     # 'Preferred Pharmacy 30-day supply: You pay $0 Standard Pharmacy 30-day
@@ -594,11 +600,17 @@ def assemble_rx_fields(category: str, data: dict) -> dict[str, str]:
     # gap-coverage program rows (Medicare Part D 'Select Insulin Drugs') are
     # sub-programs, not drug tiers — exclude them regardless of how the model
     # classified them.
+    # Only rows whose label IS an insulin-program row are excluded ("Insulin",
+    # "Select Insulin Drugs"). Real tier rows that merely mention insulin in a
+    # parenthetical note — CareFirst's "Preferred Brand Drugs (Preferred
+    # Insulin $0)" — must be kept.
     slots: dict[str, list[dict]] = {t: [] for t in _STANDARD_TIERS}
     for row in rows:
         tier = row.get("standard_tier")
-        label = (row.get("label") or "").lower()
-        if tier in slots and "insulin" not in label:
+        label = (row.get("label") or "").strip()
+        if tier in slots and not re.match(
+            r"^(?:select\s+)?insulin\b", label, re.IGNORECASE
+        ):
             slots[tier].append(row)
 
     preferred_parts: list[str] = []
@@ -777,6 +789,176 @@ def _apply_dual_level_salvage(data: dict, page_markdowns: list[dict]) -> None:
             row["in_network_mail_order"] = mail
 
 
+# The vLLM server does not enforce guided_json key names either — the model
+# has been observed emitting abbreviated keys ("retail", "mail_order") instead
+# of the schema's canonical names, silently blanking those networks.
+_ROW_KEY_ALIASES: dict[str, str] = {
+    "retail": "in_network_retail",
+    "mail_order": "in_network_mail_order",
+    "mail": "in_network_mail_order",
+    "network_retail": "in_network_retail",
+    "network_mail_order": "in_network_mail_order",
+    "oon_retail": "out_of_network_retail",
+    "oon_mail_order": "out_of_network_mail_order",
+    "preferred_retail": "preferred_pharmacy_retail",
+    "preferred_mail_order": "preferred_pharmacy_mail_order",
+    "designated_retail": "designated_network_retail",
+    "designated_mail_order": "designated_network_mail_order",
+}
+
+
+# Network-name aliases seen inside nested channel objects
+# ("retail": {"in_network": ..., "out_of_network": ...}).
+_NESTED_NET_ALIASES: dict[str, str] = {
+    "in_network": "in_network",
+    "in-network": "in_network",
+    "network": "in_network",
+    "out_of_network": "out_of_network",
+    "out-of-network": "out_of_network",
+    "oon": "out_of_network",
+    "preferred_pharmacy": "preferred_pharmacy",
+    "preferred": "preferred_pharmacy",
+    "designated_network": "designated_network",
+    "designated": "designated_network",
+}
+
+
+def _normalize_row_keys(data: dict) -> None:
+    """Map abbreviated/wrong row keys the model invents onto canonical names.
+
+    Handles both observed drifts: flat abbreviated keys ("retail" for
+    in_network_retail) and nested channel objects
+    ("retail": {"in_network": "$3", "out_of_network": "50%"}).
+    """
+    for row in data.get("drug_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        for chan_key in ("retail", "mail_order", "mail"):
+            nested = row.get(chan_key)
+            if not isinstance(nested, dict):
+                continue
+            chan = "retail" if chan_key == "retail" else "mail_order"
+            for net_alias, net in _NESTED_NET_ALIASES.items():
+                if net_alias in nested and isinstance(nested[net_alias], str):
+                    canon = f"{net}_{chan}"
+                    if row.get(canon) is None:
+                        row[canon] = nested[net_alias]
+        for alias, canon in _ROW_KEY_ALIASES.items():
+            if isinstance(row.get(alias), str) and row.get(canon) is None:
+                row[canon] = row[alias]
+
+
+# Blue Shield of California "Level A / Level B" pharmacy-participation levels.
+# Two printed layouts, both recoverable verbatim from the page markdown:
+#   Benefit Summary (column table, 30-day section comes first):
+#     | | Level A | Level B | ...
+#     | Tier 1 Drugs | $25/prescription | $30/prescription | | Not covered |
+#   SBC (in-cell):
+#     | Tier 1 | Retail : Level A: $20/prescription Level B: $25/prescription
+#       Mail Service : $40/prescription | ...
+# Loose on purpose: header cell layouts vary ("| Level A | Level B |",
+# footnote markers, extra empty cells). This is only a guard confirming the
+# document actually uses the Level A/B pharmacy-participation scheme before
+# the (already-specific) row patterns are trusted.
+_LEVEL_AB_HEADER = re.compile(
+    r"Level\s*A\b.{0,200}?Level\s*B\b", re.IGNORECASE | re.DOTALL,
+)
+_LEVEL_AB_TABLE_ROW = re.compile(
+    r"\|\s*Tier\s*(?P<tier>\d)\s*Drugs\s*\|\s*(?P<a>[^|]*?[\$%][^|]*?)\s*\|"
+    r"\s*(?P<b>[^|]*?[\$%][^|]*?)\s*\|",
+    re.IGNORECASE,
+)
+_LEVEL_AB_INCELL = re.compile(
+    r"\|\s*Tier\s*(?P<tier>\d)\s*\|\s*Retail\s*:?\s*Level\s*A\s*:\s*(?P<a>.+?)"
+    r"\s+Level\s*B\s*:\s*(?P<b>.+?)"
+    r"(?:\s+Mail\s*(?:Service|Order)?\s*:?\s*(?P<mail>[^|]+?))?\s*\|",
+    re.IGNORECASE,
+)
+
+
+def _fix_ocr_artifacts(value: str) -> str:
+    """Repair common OCR confusions in costs read from scanned-page markdown.
+
+    Force-OCR'd tables render '/' as 'l' and digits as lookalike letters:
+    '$1Olprescription' is '$10/prescription', '$5slprescription' is
+    '$55/prescription'. Only applied to markdown-salvaged values — the
+    model's own (image-read) values don't have these artifacts.
+    """
+    v = re.sub(r"(?<=[0-9OoSs])l(?=prescription)", "/", value)
+    v = re.sub(
+        r"\$([0-9OoSs]+)\b",
+        lambda m: "$" + m.group(1).translate(str.maketrans("OoSs", "0055")),
+        v,
+    )
+    return v
+
+
+def _apply_level_ab_salvage(data: dict, page_markdowns: list[dict]) -> None:
+    """Repair rows where the model dropped the Level B pharmacy price.
+
+    Blue Shield CA prices each drug tier at two pharmacy participation levels
+    (Level A cheaper, Level B standard); the model unreliably keeps only
+    Level A. Both printed layouts are parsed from the markdown and the pair
+    is restored as preferred_pharmacy (A) / in_network (B) — the same slots
+    the two-level prompt rules use.
+    """
+    text = _normalize_dashes(
+        "\n".join(re.sub(r"[ \t]+", " ", p.get("markdown", "")) for p in page_markdowns)
+    )
+    salvage: dict[str, tuple[str, str, str | None]] = {}
+    table_rows = list(_LEVEL_AB_TABLE_ROW.finditer(text))
+    # The header may sit on a page the RX selection dropped; three or more
+    # "Tier N Drugs | cost | cost" rows are strong evidence of the Level A/B
+    # column layout on their own (only Blue Shield CA names rows this way).
+    if _LEVEL_AB_HEADER.search(text) or len(table_rows) >= 3:
+        # Column layout: the 30-day retail section prints first; keep only the
+        # first occurrence per tier (later 90-day/mail sections repeat labels).
+        for m in table_rows:
+            salvage.setdefault(
+                m.group("tier"),
+                (
+                    _fix_ocr_artifacts(m.group("a").strip()),
+                    _fix_ocr_artifacts(m.group("b").strip()),
+                    None,
+                ),
+            )
+    for m in _LEVEL_AB_INCELL.finditer(text):
+        mail = (m.group("mail") or "").strip()
+        salvage.setdefault(
+            m.group("tier"),
+            (
+                _fix_ocr_artifacts(m.group("a").strip()),
+                _fix_ocr_artifacts(m.group("b").strip()),
+                _fix_ocr_artifacts(mail) if mail else None,
+            ),
+        )
+    if not salvage:
+        return
+    for row in data.get("drug_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        tm = re.search(r"tier\s*(\d)", row.get("label") or "", re.IGNORECASE)
+        if not tm or tm.group(1) not in salvage:
+            continue
+        a, b, mail = salvage[tm.group(1)]
+        cur_pref = row.get("preferred_pharmacy_retail")
+        cur_inn = row.get("in_network_retail")
+        has_both = (
+            isinstance(cur_pref, str) and cur_pref.strip()
+            and isinstance(cur_inn, str) and cur_inn.strip()
+            and cur_pref.strip() != cur_inn.strip()
+        ) or (
+            isinstance(cur_inn, str)
+            and _split_pharmacy_levels(cur_inn)[0] is not None
+        )
+        if not has_both:
+            row["preferred_pharmacy_retail"] = a
+            row["in_network_retail"] = b
+        cur_mail = row.get("in_network_mail_order")
+        if mail and not (isinstance(cur_mail, str) and cur_mail.strip()):
+            row["in_network_mail_order"] = mail
+
+
 def _parse_model_json(raw: str) -> dict:
     """Parse model output tolerantly.
 
@@ -846,8 +1028,10 @@ async def extract_rx_fields(
             f"RX extraction returned unparseable content: {last_exc}"
         ) from last_exc
 
+    _normalize_row_keys(data)
     if category == "health":
         _apply_dual_level_salvage(data, page_markdowns)
+        _apply_level_ab_salvage(data, page_markdowns)
 
     fields = assemble_rx_fields(category, data)
     logger.info(
