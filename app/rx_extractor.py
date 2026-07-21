@@ -278,7 +278,11 @@ def _build_rx_system_prompt(category: str) -> str:
         "For combined multi-class rows, the printed tier number decides: Tier 1 → "
         "generic, Tier 2 → preferred_brand, Tier 3 → non_preferred_brand, Tier 4 → "
         "preferred_specialty, Tier 5 → non_preferred_specialty. Example: 'Typically "
-        "Non-Preferred Brand and Generic drugs (Tier 3)' → non_preferred_brand.\n\n"
+        "Non-Preferred Brand and Generic drugs (Tier 3)' → non_preferred_brand.\n"
+        "A single row pricing SEVERAL tiers at once — 'Tier 1/Tier 2/Tier 3 "
+        "Prescription drugs' — is output as ONE row: keep the combined tier label and "
+        "the slash-separated costs VERBATIM (standard_tier 'other'); it is "
+        "split per tier downstream.\n\n"
         "COST VALUES: copy the printed cost expression, keeping meaningful qualifiers "
         "('$10', '$3 copay', '50% coinsurance', '30% coinsurance up to $250', 'No "
         "charge after deductible', 'Deductible, then $50', '100% until deductible is "
@@ -439,6 +443,9 @@ def _clean_cost(value: Any) -> str:
     v = re.sub(
         r"\s+for up to a \d+[\s-]*day supply\.?$", "", v, flags=re.IGNORECASE,
     ).strip()
+    v = re.sub(
+        r"\s*\(\s*\d+[\s-]*day supply\s*\)\s*$", "", v, flags=re.IGNORECASE,
+    ).strip()
     return _strip_rx_suffix(v)
 
 
@@ -593,6 +600,7 @@ def assemble_rx_fields(category: str, data: dict) -> dict[str, str]:
     """
     fields: dict[str, str] = {f: "" for f in rx_owned_fields(category)}
     rows = [r for r in (data.get("drug_rows") or []) if isinstance(r, dict)]
+    rows = _expand_combined_tier_rows(rows)
     oon_status = (data.get("out_of_network_pharmacy") or "").strip()
     merge_preferred = category == "health"
 
@@ -874,6 +882,71 @@ _LEVEL_AB_INCELL = re.compile(
     r"(?:\s+Mail\s*(?:Service|Order)?\s*:?\s*(?P<mail>[^|]+?))?\s*\|",
     re.IGNORECASE,
 )
+
+
+_TIER_NUM_TO_STD: dict[int, str] = {
+    1: "generic",
+    2: "preferred_brand",
+    3: "non_preferred_brand",
+    4: "preferred_specialty",
+    5: "non_preferred_specialty",
+}
+
+
+def _split_slash_costs(value: str) -> list[str]:
+    """Split 'A/B/C' cost lists on slashes that START a new cost.
+
+    '$30/$65 after deductible / $100 after deductible (30-day supply)'
+    -> ['$30', '$65 after deductible', '$100 after deductible (30-day supply)']
+    Slashes inside a cost ('/prescription', '50% up to $250/fill') don't split.
+    """
+    v = _normalize_dashes(value.strip())
+    return [
+        p.strip()
+        for p in re.split(r"\s*/\s*(?=\$|\d+(?:\.\d+)?\s*%|no charge)", v, flags=re.IGNORECASE)
+        if p.strip()
+    ]
+
+
+def _expand_combined_tier_rows(rows: list[dict]) -> list[dict]:
+    """Split one row that prices several tiers at once into per-tier rows.
+
+    Fallon-style summaries print a single row 'Tier 1/Tier 2/Tier 3 —
+    Prescription drugs...' costed '$30/$65 after deductible / $100 after
+    deductible'. No single standard_tier fits such a row (the model labels it
+    'other', which would discard it), so it is expanded positionally: the Nth
+    cost goes to the Nth listed tier, for every *_retail / *_mail_order field
+    whose part count matches.
+    """
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        label = row.get("label") or ""
+        tiers = [int(n) for n in re.findall(r"tier\s*(\d)", label, re.IGNORECASE)]
+        if len(tiers) < 2 or len(set(tiers)) != len(tiers):
+            out.append(row)
+            continue
+        split_fields: dict[str, list[str]] = {}
+        for key, val in row.items():
+            if (
+                isinstance(val, str)
+                and (key.endswith("_retail") or key.endswith("_mail_order"))
+            ):
+                parts = _split_slash_costs(val)
+                if len(parts) == len(tiers):
+                    split_fields[key] = parts
+        if not split_fields:
+            out.append(row)
+            continue
+        for i, tier_num in enumerate(tiers):
+            new_row = dict(row)
+            new_row["label"] = f"Tier {tier_num}"
+            new_row["standard_tier"] = _TIER_NUM_TO_STD.get(tier_num, "other")
+            for key, parts in split_fields.items():
+                new_row[key] = parts[i]
+            out.append(new_row)
+    return out
 
 
 def _fix_ocr_artifacts(value: str) -> str:
