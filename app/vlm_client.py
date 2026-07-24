@@ -224,7 +224,11 @@ async def _chat_completion(messages: list[dict], *, extra_body: dict | None = No
         "seed": 0,  # pin sampling seed — reduces run-to-run output variance
     }
     if extra_body:
-        payload["extra_body"] = extra_body
+        # The OpenAI Python client merges `extra_body` into the request JSON.
+        # We POST with httpx, so those keys (e.g. guided_json) must be top-level.
+        # Nesting them under an "extra_body" field is ignored by vLLM, which
+        # silently disables guided decoding and makes outputs non-deterministic.
+        payload.update(extra_body)
 
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:

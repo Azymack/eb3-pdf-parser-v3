@@ -1067,6 +1067,43 @@ def _parse_model_json(raw: str) -> dict:
     return json.loads(repaired)
 
 
+def _network_retail_populated(fields: dict[str, str], display: str) -> bool:
+    """True when any per-tier retail field for this network has a real cost."""
+    return any(fields.get(f"{display} {suffix}") for suffix in _TIER_SUFFIX.values())
+
+
+def _oon_costs_missing_despite_coverage(data: dict, fields: dict[str, str]) -> bool:
+    """Detect the flaky failure mode: INN scraped, OON covered, but OON blank.
+
+    The VLM sometimes omits out_of_network_* costs even when it correctly sets
+    out_of_network_pharmacy='covered'. Worth one guided retry.
+    """
+    if (data.get("out_of_network_pharmacy") or "").strip() != "covered":
+        return False
+    if _network_retail_populated(fields, "Out-of-Network"):
+        return False
+    return (
+        _network_retail_populated(fields, "In-Network")
+        or _network_retail_populated(fields, "Designated Network")
+    )
+
+
+async def _run_rx_vlm_once(
+    messages: list[dict],
+    schema: dict,
+) -> dict:
+    """One guided RX call → parsed structured dict. Raises on unparseable JSON."""
+    raw = await _chat_completion(messages, extra_body={"guided_json": schema})
+    try:
+        return _parse_model_json(raw)
+    except json.JSONDecodeError:
+        logger.warning(
+            "rx_extractor: JSON parse failed",
+            extra={"content_preview": raw[:300]},
+        )
+        raise
+
+
 async def extract_rx_fields(
     category: str,
     page_markdowns: list[dict],
@@ -1085,28 +1122,44 @@ async def extract_rx_fields(
     data: dict | None = None
     last_exc: Exception | None = None
     for attempt in (1, 2):
-        raw = await _chat_completion(messages, extra_body={"guided_json": schema})
         try:
-            data = _parse_model_json(raw)
+            data = await _run_rx_vlm_once(messages, schema)
             break
         except json.JSONDecodeError as exc:
             last_exc = exc
             logger.warning(
                 "rx_extractor: JSON parse failed (attempt %d/2)",
                 attempt,
-                extra={"content_preview": raw[:300]},
             )
     if data is None:
         raise ValueError(
             f"RX extraction returned unparseable content: {last_exc}"
         ) from last_exc
 
-    _normalize_row_keys(data)
-    if category == "health":
-        _apply_dual_level_salvage(data, page_markdowns)
-        _apply_level_ab_salvage(data, page_markdowns)
+    def _finalize(structured: dict) -> dict[str, str]:
+        _normalize_row_keys(structured)
+        if category == "health":
+            _apply_dual_level_salvage(structured, page_markdowns)
+            _apply_level_ab_salvage(structured, page_markdowns)
+        return assemble_rx_fields(category, structured)
 
-    fields = assemble_rx_fields(category, data)
+    fields = _finalize(data)
+
+    # Defense in depth: even with guided_json, GPU batching can drop OON costs.
+    # One retry when INN is populated, status is covered, and OON is blank.
+    if _oon_costs_missing_despite_coverage(data, fields):
+        logger.warning(
+            "rx_extractor: OON costs missing despite covered status — retrying once",
+            extra={"category": category},
+        )
+        try:
+            retry_data = await _run_rx_vlm_once(messages, schema)
+            retry_fields = _finalize(retry_data)
+            if _network_retail_populated(retry_fields, "Out-of-Network"):
+                data, fields = retry_data, retry_fields
+        except json.JSONDecodeError:
+            logger.warning("rx_extractor: OON completeness retry returned bad JSON")
+
     logger.info(
         "rx_extractor: extraction complete",
         extra={
