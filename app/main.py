@@ -12,7 +12,11 @@ from .config import get_settings
 from .docling_client import convert_pdf, slice_pdf_to_max_pages
 from .image_renderer import render_pages
 from .page_router import select_pages, select_rx_pages
-from .post_process import apply_post_processing, vlm_field_names
+from .post_process import (
+    apply_post_processing,
+    clear_pharmacy_only_level1_designated,
+    vlm_field_names,
+)
 from .rx_extractor import (
     RX_EXTRACTOR_CATEGORIES,
     extract_rx_fields,
@@ -356,6 +360,8 @@ async def _run_pipeline(
     # ── Post-processing: compute derived fields, then serialize ───────────────
     raw_fields = vlm_result.get("fields", {})
     processed_fields = apply_post_processing(raw_fields, field_names)
+    if category == "health_3tier":
+        clear_pharmacy_only_level1_designated(processed_fields, selected_markdowns)
     if rx_fields is not None:
         suppress_medical_deductible_echo(rx_fields, raw_fields)
         processed_fields.update(rx_fields)

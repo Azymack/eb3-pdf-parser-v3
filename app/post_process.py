@@ -1684,3 +1684,64 @@ def apply_post_processing(
                 result["Out-of-Network Mail Order RX"] = "Not covered"
 
     return result
+
+
+# Medical benefit suffixes under Designated Network that must NOT inherit
+# In-Network costs when column 1 is a pharmacy-only Level 1 (Anthem).
+_DESIGNATED_MEDICAL_SUFFIXES: tuple[str, ...] = (
+    "Single Deductible",
+    "Family Deductible",
+    "Single OOP Max",
+    "Family OOP Max",
+    "Coinsurance",
+    "PCP Visit",
+    "Specialist Visit",
+    "Urgent Care Visit",
+    "ER Visit",
+    "Preventive Visit",
+    "Outpatient Surgery",
+    "Inpatient Surgery",
+    "Newborn Delivery",
+    "Major Diagnostics",
+    "CT scan, PT scan, MRI",
+)
+
+_PHARMACY_ONLY_LEVEL1 = re.compile(
+    r"Level\s*1\s+Pharmacy",
+    re.IGNORECASE,
+)
+_PCP_NOT_APPLICABLE_COL1 = re.compile(
+    r"Primary care visit[^|]{0,80}\|\s*Not Applicable\b",
+    re.IGNORECASE,
+)
+
+
+def clear_pharmacy_only_level1_designated(
+    fields: dict[str, str | None],
+    page_markdowns: list[dict],
+) -> None:
+    """Clear Designated medical fields when Level 1 is pharmacy-only.
+
+    Anthem health_3tier SBCs use 'Level 1 Pharmacy-RX Only | In-Network |
+    Out-of-Network'. Column 1 is Not Applicable for medical benefits; the VLM
+    often copies In-Network costs into Designated Network *. Leave Designated
+    RX fields alone — those correctly use Level 1 pharmacy prices.
+    """
+    text = "\n".join(
+        (p.get("markdown") or "") for p in page_markdowns if isinstance(p, dict)
+    )
+    if not _PHARMACY_ONLY_LEVEL1.search(text):
+        return
+    if not _PCP_NOT_APPLICABLE_COL1.search(text):
+        return
+
+    for suffix in _DESIGNATED_MEDICAL_SUFFIXES:
+        key = f"Designated Network {suffix}"
+        if key not in fields:
+            continue
+        # Preserve an explicit Not Applicable the model already got right.
+        val = (fields.get(key) or "").strip()
+        if re.fullmatch(r"not\s+applicable|n/?a", val, re.IGNORECASE):
+            fields[key] = "Not Applicable"
+            continue
+        fields[key] = "Not Applicable"

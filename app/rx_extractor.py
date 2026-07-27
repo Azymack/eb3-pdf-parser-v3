@@ -209,10 +209,17 @@ _RX_SYSTEM_PROMPT_HEALTH_NETWORKS = (
 )
 
 _RX_SYSTEM_PROMPT_3TIER_NETWORKS = (
-    "NETWORK COLUMNS:\n"
-    "- designated_network_*: the designated / first-tier network column.\n"
-    "- in_network_*: the standard in-network column.\n"
-    "- out_of_network_*: the out-of-network / non-participating column.\n"
+    "NETWORK COLUMNS — map by POSITION (left → right), not by label wording:\n"
+    "- designated_network_*: FIRST cost column (cheapest / 'You will pay the "
+    "least' / Level 1 / Designated / Tier 1 Pharmacy).\n"
+    "- in_network_*: MIDDLE cost column (In-Network / 'You will pay more' / "
+    "Tier 2).\n"
+    "- out_of_network_*: LAST cost column (Out-of-Network / Non-Participating).\n"
+    "When the first column is a pharmacy-only Level 1 column and prints a "
+    "real drug cost, that cost goes in designated_network_*. Never leave "
+    "designated_network_* null just because the medical benefit rows say "
+    "Not Applicable in that column — those N/A cells apply to medical "
+    "services, not to the pharmacy table.\n"
 )
 
 
@@ -460,6 +467,16 @@ def _clean_deductible(value: Any) -> str:
     # separate RX deductible.
     if not _DOLLARS.search(v):
         return ""
+    # Copay / coinsurance cell values are not deductibles (Alliance 1782404591
+    # wrongly echoed "$10 Copay / prescription" into rx_deductible).
+    low = v.lower()
+    if re.search(r"\bcopay(?:ment)?\b", low) and not re.search(r"\bdeductible\b", low):
+        return ""
+    if re.search(r"\bcoinsurance\b", low) and not re.search(r"\bdeductible\b", low):
+        return ""
+    # Coinsurance caps ("up to $500/prescription") are not deductibles either.
+    if re.search(r"\bup to\s*\$", low) and re.search(r"prescription|copay", low):
+        return ""
     return v
 
 
@@ -601,6 +618,7 @@ def assemble_rx_fields(category: str, data: dict) -> dict[str, str]:
     fields: dict[str, str] = {f: "" for f in rx_owned_fields(category)}
     rows = [r for r in (data.get("drug_rows") or []) if isinstance(r, dict)]
     rows = _expand_combined_tier_rows(rows)
+    rows = _expand_preferred_nonpreferred_specialty(rows)
     oon_status = (data.get("out_of_network_pharmacy") or "").strip()
     merge_preferred = category == "health"
 
@@ -908,6 +926,77 @@ def _split_slash_costs(value: str) -> list[str]:
     ]
 
 
+def _expand_preferred_nonpreferred_specialty(rows: list[dict]) -> list[dict]:
+    """Split one Specialty row that prices Preferred + Non-preferred into two.
+
+    Aetna: 'Specialty drugs | Preferred: 30% ...; Non-preferred: 50% ...'
+    must fill Tier 4 and Tier 5, not leave Tier 5 blank.
+    """
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        label = (row.get("label") or "").strip()
+        is_specialty = (
+            row.get("standard_tier") in (
+                "preferred_specialty", "non_preferred_specialty", "other",
+            )
+            or bool(re.search(r"specialty", label, re.IGNORECASE))
+        )
+        if not is_specialty:
+            out.append(row)
+            continue
+
+        split_any = False
+        pref_vals: dict[str, str] = {}
+        nonpref_vals: dict[str, str] = {}
+        for key, val in row.items():
+            if not (
+                isinstance(key, str)
+                and isinstance(val, str)
+                and (key.endswith("_retail") or key.endswith("_mail_order"))
+            ):
+                continue
+            m = re.search(
+                r"Preferred\s*:?\s*(?P<pref>.+?)\s*;?\s*"
+                r"Non[- ]?preferred\s*:?\s*(?P<non>.+)$",
+                val,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if not m:
+                continue
+            split_any = True
+            pref_vals[key] = m.group("pref").strip(" ;,")
+            nonpref_vals[key] = m.group("non").strip(" ;,")
+
+        if not split_any:
+            out.append(row)
+            continue
+
+        pref_row = dict(row)
+        pref_row["label"] = label or "Specialty drugs (Preferred)"
+        pref_row["standard_tier"] = "preferred_specialty"
+        for k, v in pref_vals.items():
+            pref_row[k] = v
+
+        non_row = dict(row)
+        non_row["label"] = "Specialty drugs (Non-Preferred)"
+        non_row["standard_tier"] = "non_preferred_specialty"
+        for k, v in nonpref_vals.items():
+            non_row[k] = v
+        for k in list(non_row):
+            if (
+                isinstance(k, str)
+                and (k.endswith("_retail") or k.endswith("_mail_order"))
+                and k not in nonpref_vals
+            ):
+                non_row[k] = None
+
+        out.append(pref_row)
+        out.append(non_row)
+    return out
+
+
 def _expand_combined_tier_rows(rows: list[dict]) -> list[dict]:
     """Split one row that prices several tiers at once into per-tier rows.
 
@@ -1067,6 +1156,509 @@ def _parse_model_json(raw: str) -> dict:
     return json.loads(repaired)
 
 
+# ---------------------------------------------------------------------------
+# Embedded Specialty Drugs channel salvage (UHC-style)
+# ---------------------------------------------------------------------------
+# Some SBCs put Specialty Drugs pricing INSIDE each tier cell next to Retail
+# and Mail-Order, with no standalone specialty row. The VLM often keeps only
+# Retail/Mail and drops Specialty. Pull it out deterministically.
+
+_SPECIALTY_CHANNEL_LABEL = re.compile(
+    r"Specialty\s+Drugs?\s*\**\s*:?\s*",
+    re.IGNORECASE,
+)
+_LABELED_CHANNEL_SPLIT = re.compile(
+    r"(?:^|[,/;]\s*|\s+)(Retail|Mail[\s-]*Order|Mail|Home\s+Delivery|"
+    r"Specialty\s+Drugs?)\s*\**\s*:\s*",
+    re.IGNORECASE,
+)
+_UNLABELED_RETAIL_MAIL_SPEC = re.compile(
+    r"(?P<retail>.+?)\s+retail\b\s+"
+    r"(?P<mail>.+?)\s+(?:mail(?:[\s-]*order)?|home\s+delivery)\b\s+"
+    r"(?P<spec>.+?)\s*Specialty\s+Drugs?\s*\**\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_embedded_specialty_channels(
+    value: str,
+) -> tuple[str, str | None, str | None]:
+    """Split a tier cell into (retail, mail_order, specialty).
+
+    Returns (original, None, None) when no Specialty Drugs channel is present.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return value if isinstance(value, str) else "", None, None
+    v = _normalize_dashes(value).strip()
+    if not re.search(r"Specialty\s+Drugs?", v, re.IGNORECASE):
+        return v, None, None
+
+    markers = list(_LABELED_CHANNEL_SPLIT.finditer(v))
+    if len(markers) >= 2 and any(
+        m.group(1).lower().startswith("specialty") for m in markers
+    ):
+        buckets: dict[str, list[str]] = {"retail": [], "mail": [], "specialty": []}
+        for i, m in enumerate(markers):
+            name = re.sub(r"[\s-]+", " ", m.group(1).lower()).strip()
+            chunk = v[
+                m.end(): markers[i + 1].start() if i + 1 < len(markers) else len(v)
+            ]
+            chunk = chunk.strip(" ,/;")
+            if not chunk:
+                continue
+            if name == "retail":
+                buckets["retail"].append(chunk)
+            elif name.startswith("mail") or name.startswith("home"):
+                buckets["mail"].append(chunk)
+            elif name.startswith("specialty"):
+                buckets["specialty"].append(chunk)
+        if buckets["specialty"]:
+            retail = " / ".join(buckets["retail"]) if buckets["retail"] else ""
+            if not retail and markers[0].start() > 0:
+                leading = v[: markers[0].start()].strip(" ,/;")
+                if leading and _COST_MARKER.search(leading):
+                    retail = leading
+            mail = " / ".join(buckets["mail"]) if buckets["mail"] else None
+            spec = " / ".join(buckets["specialty"])
+            return retail or v, mail, spec
+
+    m = _UNLABELED_RETAIL_MAIL_SPEC.search(v)
+    if m:
+        return (
+            m.group("retail").strip(" ,/;"),
+            m.group("mail").strip(" ,/;"),
+            m.group("spec").strip(" ,/;"),
+        )
+
+    m = re.search(
+        r"Specialty\s+Drugs?\s*\**\s*:?\s*(?P<spec>.+)$",
+        v,
+        re.IGNORECASE,
+    )
+    if m:
+        spec = m.group("spec").strip(" ,/;")
+        retail = _SPECIALTY_CHANNEL_LABEL.split(v)[0].strip(" ,/;")
+        if spec and _COST_MARKER.search(spec):
+            return retail, None, spec
+
+    return v, None, None
+
+
+def _apply_embedded_specialty_salvage(data: dict) -> None:
+    """Pull in-cell Specialty Drugs prices into a synthetic specialty row.
+
+    Lands in preferred_specialty (Tier 4) when no specialty/Tier-4 row exists;
+    otherwise non_preferred_specialty (Tier 5) so a printed Tier 4 high-cost
+    row keeps the Tier 4 RX slot (UHC 4-tier + specialty-channel docs).
+    """
+    rows = [r for r in (data.get("drug_rows") or []) if isinstance(r, dict)]
+    if not rows:
+        return
+
+    specialty_by_field: dict[str, list[str]] = {}
+    touched = False
+
+    for row in rows:
+        label = (row.get("label") or "").strip()
+        if re.search(r"specialty", label, re.IGNORECASE) and not re.search(
+            r"tier\s*[1-3]\b", label, re.IGNORECASE
+        ):
+            continue
+        if row.get("standard_tier") in (
+            "preferred_specialty", "non_preferred_specialty",
+        ):
+            continue
+
+        for key, val in list(row.items()):
+            if not isinstance(key, str) or not isinstance(val, str):
+                continue
+            if not (key.endswith("_retail") or key.endswith("_mail_order")):
+                continue
+            retail, mail, spec = _split_embedded_specialty_channels(val)
+            if not spec:
+                continue
+            touched = True
+            if key.endswith("_mail_order"):
+                net_retail_key = key[: -len("_mail_order")] + "_retail"
+                row[key] = mail or ""
+            else:
+                net_retail_key = key
+                mail_key = key[: -len("_retail")] + "_mail_order"
+                if mail and not row.get(mail_key):
+                    row[mail_key] = mail
+                row[key] = retail
+            specialty_by_field.setdefault(net_retail_key, []).append(spec)
+
+    if not touched or not specialty_by_field:
+        return
+
+    _append_synthetic_specialty_row(data, rows, specialty_by_field)
+
+
+def _append_synthetic_specialty_row(
+    data: dict,
+    rows: list[dict],
+    specialty_by_field: dict[str, list[str]],
+) -> None:
+    has_specialty_row = any(
+        (r.get("standard_tier") in ("preferred_specialty", "non_preferred_specialty"))
+        or re.search(r"^\s*specialty\b", (r.get("label") or ""), re.IGNORECASE)
+        for r in rows
+    )
+    has_tier4ish = any(
+        (r.get("standard_tier") == "preferred_specialty")
+        or re.search(
+            r"tier\s*4\b|highest[- ]cost|high[- ]cost option|additional high|"
+            r"you will pay the most",
+            (r.get("label") or ""),
+            re.IGNORECASE,
+        )
+        for r in rows
+    )
+    # Four printed formulary/cost tiers already fill Generic..Tier 4 — specialty
+    # channel must not join into Tier 4 RX.
+    printed_non_specialty = [
+        r for r in rows
+        if r.get("standard_tier") in _STANDARD_TIERS
+        and not re.search(
+            r"^\s*specialty\s+drugs?\b", (r.get("label") or ""), re.IGNORECASE,
+        )
+    ]
+    target_tier = (
+        "non_preferred_specialty"
+        if (has_specialty_row or has_tier4ish or len(printed_non_specialty) >= 4)
+        else "preferred_specialty"
+    )
+
+    sample = rows[0]
+    synth: dict[str, Any] = {
+        "label": "Specialty Drugs",
+        "standard_tier": target_tier,
+    }
+    for key in sample:
+        if key not in ("label", "standard_tier"):
+            synth[key] = None
+
+    for field, parts in specialty_by_field.items():
+        cleaned = [p for p in (_clean_cost(x) for x in parts) if p]
+        if cleaned:
+            synth[field] = " / ".join(_dedupe_keep_order(cleaned))
+
+    if not any(
+        isinstance(v, str) and v.strip()
+        for k, v in synth.items()
+        if isinstance(k, str) and (k.endswith("_retail") or k.endswith("_mail_order"))
+    ):
+        return
+
+    rows.append(synth)
+    data["drug_rows"] = rows
+
+
+_MD_TIER_INLINE_SPEC = re.compile(
+    r"Tier\s*(?P<tier>[1-4])\b.{0,500}?"
+    r"(?P<spec>"
+    r"\$[\d.,]+(?:\s*copay(?:ment)?(?:\s*/\s*prescription)?)?"
+    r"|\d+(?:\.\d+)?%\s*coinsurance(?:\s*/?\s*Specialty\s+Drugs?\s*up to\s*\$[\d.,]+\s*copay(?:\s*per\s*prescription)?)?"
+    r"|\d+(?:\.\d+)?%\s*coinsurance(?:[^|$]{0,60})?"
+    r")"
+    r"\s*/?\s*Specialty\s+Drugs?",
+    re.IGNORECASE | re.DOTALL,
+)
+_MD_TIER_LABELED_SPEC = re.compile(
+    r"Tier\s*(?P<tier>[1-4])\b.{0,400}?"
+    r"Specialty\s+Drugs?\s*\**\s*:\s*(?P<spec>[^|]+?)"
+    r"(?=\s*\||\s*$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _apply_embedded_specialty_markdown_salvage(
+    data: dict, page_markdowns: list[dict],
+) -> None:
+    """Recover Specialty Drugs channel prices from page markdown.
+
+    Used when the VLM returned clean retail/mail with specialty already dropped
+    (the common failure mode on UHC SBCs).
+    """
+    rows = [r for r in (data.get("drug_rows") or []) if isinstance(r, dict)]
+    if not rows:
+        return
+    # Skip only when a Specialty Drugs aggregate row already carries costs.
+    # A printed "Tier 4 - Additional High-Cost Options" row is NOT that.
+    for r in rows:
+        label = (r.get("label") or "").strip()
+        if not re.search(r"specialty\s+drugs?\b", label, re.IGNORECASE):
+            continue
+        if re.search(r"tier\s*4\b|high[- ]cost", label, re.IGNORECASE):
+            continue
+        for k, v in r.items():
+            if (
+                isinstance(k, str)
+                and k.endswith("_retail")
+                and isinstance(v, str)
+                and v.strip()
+                and v.strip().lower() != "not covered"
+            ):
+                return
+
+    text = _normalize_dashes(
+        "\n".join(p.get("markdown") or "" for p in page_markdowns)
+    )
+    if not re.search(r"Specialty\s+Drugs?", text, re.IGNORECASE):
+        return
+
+    by_tier: dict[int, str] = {}
+    for rx in (_MD_TIER_LABELED_SPEC, _MD_TIER_INLINE_SPEC):
+        for m in rx.finditer(text):
+            tier = int(m.group("tier"))
+            spec = m.group("spec").strip(" ,/;.")
+            # Inline form captures from the first '$' in the cell — take the
+            # last cost fragment before "Specialty Drugs" (the specialty price).
+            if " retail " in f" {spec.lower()} " or " mail" in spec.lower():
+                # "... retail $10 mail $5 copay/" → specialty is the last $amount
+                last = re.findall(
+                    r"(\$[^$]*?)\s*$",
+                    spec,
+                )
+                if last:
+                    spec = last[-1].strip(" ,/;.")
+            spec = re.split(
+                r"\s{2,}|\s+Not Covered", spec, maxsplit=1, flags=re.IGNORECASE,
+            )[0].strip(" ,/;.")
+            if not spec or not _COST_MARKER.search(spec):
+                continue
+            if re.search(r"\bthrough mail\b|\bnot covered through\b", spec, re.I):
+                continue
+            by_tier.setdefault(tier, spec)
+
+    if len(by_tier) < 2:
+        return
+
+    parts = [by_tier[t] for t in sorted(by_tier)]
+    specialty_by_field: dict[str, list[str]] = {"in_network_retail": parts}
+    _append_synthetic_specialty_row(data, rows, specialty_by_field)
+
+
+# ---------------------------------------------------------------------------
+# RX deductible salvage from SBC "other deductibles" row
+# ---------------------------------------------------------------------------
+
+_OTHER_DEDUCTIBLES_BLOCK = re.compile(
+    r"Are there other deductibles for specific services\?\s*"
+    r"(?P<answer>.*?)(?="
+    r"You must pay all of the costs for these services"
+    r"|You don't have to meet deductibles for specific services"
+    r"|What is the out-of-pocket"
+    r"|Is there an overall"
+    r"|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_RX_DED_AMOUNT = re.compile(
+    r"\$\s*([\d,]+(?:\.\d+)?)\s*/?\s*(?:Individual|person|self[- ]only|employee)"
+    r".{0,40}?"
+    r"\$\s*([\d,]+(?:\.\d+)?)\s*/?\s*(?:Family|family)",
+    re.IGNORECASE | re.DOTALL,
+)
+_RX_DED_SINGLE = re.compile(
+    r"\$\s*([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_RX_DED_CONTEXT = re.compile(
+    r"prescription|medication|pharmacy|tier\s*[2-5]|drug",
+    re.IGNORECASE,
+)
+
+
+def _format_rx_deductible(individual: str, family: str | None = None) -> str:
+    ind = individual.replace(",", "")
+    if family:
+        fam = family.replace(",", "")
+        return f"${ind} Individual / ${fam} Family"
+    return f"${ind}"
+
+
+def _parse_other_deductibles_rx(markdown: str) -> str | None:
+    """Return RX deductible from the Important Questions row, or '' if No.
+
+    None means the row was not found / not parseable — leave the VLM value.
+    """
+    if not markdown:
+        return None
+    m = _OTHER_DEDUCTIBLES_BLOCK.search(markdown)
+    if not m:
+        return None
+    answer = re.sub(r"\s+", " ", m.group("answer")).strip(" |")
+    if re.match(r"^No\b", answer, re.IGNORECASE):
+        return ""
+    if not re.match(r"^Yes\b", answer, re.IGNORECASE):
+        return None
+    if not _RX_DED_CONTEXT.search(answer):
+        return ""
+    pair = _RX_DED_AMOUNT.search(answer)
+    if pair:
+        return _format_rx_deductible(pair.group(1), pair.group(2))
+    singles = _RX_DED_SINGLE.findall(answer)
+    if len(singles) >= 2:
+        return _format_rx_deductible(singles[0], singles[1])
+    if len(singles) == 1:
+        return _format_rx_deductible(singles[0])
+    return None
+
+
+_MD_AETNA_PREF_NONPREF_SPEC = re.compile(
+    r"Specialty\s+drugs?\b.{0,200}?"
+    r"Preferred\s*:?\s*(?P<pref>\d+(?:\.\d+)?%\s*coinsurance[^;|]*)\s*;\s*"
+    r"Non[- ]?preferred\s*:?\s*"
+    r"(?P<non>\d+(?:\.\d+)?%\s*coinsurance[^|;]*)?",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _apply_aetna_specialty_split_salvage(
+    data: dict, page_markdowns: list[dict],
+) -> None:
+    """Fill Tier 5 when Specialty row has Preferred + Non-preferred in markdown."""
+    rows = [r for r in (data.get("drug_rows") or []) if isinstance(r, dict)]
+    has_tier5 = any(
+        r.get("standard_tier") == "non_preferred_specialty"
+        and any(
+            isinstance(r.get(k), str) and str(r.get(k)).strip()
+            for k in r
+            if isinstance(k, str) and k.endswith("_retail")
+        )
+        for r in rows
+    )
+    if has_tier5:
+        return
+
+    text = _normalize_dashes(
+        "\n".join(p.get("markdown") or "" for p in page_markdowns)
+    )
+    m = _MD_AETNA_PREF_NONPREF_SPEC.search(text)
+    if not m:
+        return
+    pref = (m.group("pref") or "").strip(" ;,|")
+    non = (m.group("non") or "").strip(" ;,|")
+    # Docling often page-breaks after 'Non-preferred:' — pull the next
+    # coinsurance amount from the following ~400 characters.
+    if not non:
+        tail = text[m.end(): m.end() + 400]
+        m2 = re.search(
+            r"(\d+(?:\.\d+)?%\s*coinsurance[^|;]{0,80})",
+            tail,
+            re.IGNORECASE,
+        )
+        if m2:
+            non = m2.group(1).strip(" ;,|")
+    non = re.split(r"\s{2,}", non, maxsplit=1)[0].strip()
+    if not pref or not non or not _COST_MARKER.search(non):
+        return
+
+    updated = False
+    for r in rows:
+        if r.get("standard_tier") == "preferred_specialty" or re.search(
+            r"specialty", (r.get("label") or ""), re.IGNORECASE,
+        ):
+            cur = (r.get("in_network_retail") or "").lower()
+            if "non-preferred" not in cur and "non preferred" not in cur:
+                r["in_network_retail"] = pref
+                r["standard_tier"] = "preferred_specialty"
+                updated = True
+                break
+    if not updated:
+        sample = rows[0] if rows else {}
+        pref_row = {
+            k: None for k in sample if k not in ("label", "standard_tier")
+        }
+        pref_row.update({
+            "label": "Specialty drugs (Preferred)",
+            "standard_tier": "preferred_specialty",
+            "in_network_retail": pref,
+        })
+        rows.append(pref_row)
+
+    sample = rows[0]
+    non_row: dict[str, Any] = {
+        "label": "Specialty drugs (Non-Preferred)",
+        "standard_tier": "non_preferred_specialty",
+    }
+    for key in sample:
+        if key not in ("label", "standard_tier"):
+            non_row[key] = None
+    non_row["in_network_retail"] = non
+    rows.append(non_row)
+    data["drug_rows"] = rows
+
+
+def _split_merged_tier4_specialty_channel(data: dict) -> None:
+    """Un-merge '$250 / $15 / $150 / $350 / $500' style Tier 4 contamination.
+
+    When the VLM packs the printed Tier 4 cost AND the per-tier Specialty
+    Drugs channel into preferred_specialty retail, keep the first cost as
+    Tier 4 and move the rest into non_preferred_specialty (Tier 5).
+    """
+    rows = [r for r in (data.get("drug_rows") or []) if isinstance(r, dict)]
+    existing_t5 = next(
+        (r for r in rows if r.get("standard_tier") == "non_preferred_specialty"),
+        None,
+    )
+    t5_populated = bool(
+        existing_t5
+        and isinstance(existing_t5.get("in_network_retail"), str)
+        and existing_t5["in_network_retail"].strip()
+    )
+    for row in rows:
+        if row.get("standard_tier") != "preferred_specialty":
+            continue
+        retail = row.get("in_network_retail")
+        if not isinstance(retail, str) or " / " not in retail:
+            continue
+        parts = [p.strip() for p in retail.split(" / ") if p.strip()]
+        # If Tier 5 already holds the specialty channel, always keep only the
+        # first Tier 4 atom. Otherwise require 3+ parts before splitting.
+        if t5_populated and len(parts) >= 2:
+            row["in_network_retail"] = parts[0]
+            return
+        if len(parts) < 3:
+            continue
+        row["in_network_retail"] = parts[0]
+        rest = " / ".join(parts[1:])
+        if existing_t5 is not None:
+            if not (existing_t5.get("in_network_retail") or "").strip():
+                existing_t5["in_network_retail"] = rest
+        else:
+            sample = row
+            synth: dict[str, Any] = {
+                "label": "Specialty Drugs",
+                "standard_tier": "non_preferred_specialty",
+            }
+            for key in sample:
+                if key not in ("label", "standard_tier"):
+                    synth[key] = None
+            synth["in_network_retail"] = rest
+            rows.append(synth)
+            data["drug_rows"] = rows
+        return
+
+
+def _apply_rx_deductible_salvage(data: dict, page_markdowns: list[dict]) -> None:
+    """Override flaky VLM rx_deductible_* from the SBC Important Questions row."""
+    text = "\n\n".join(
+        p.get("markdown") or "" for p in page_markdowns if isinstance(p, dict)
+    )
+    parsed = _parse_other_deductibles_rx(text)
+    if parsed is None:
+        return
+
+    keys = [k for k in data if isinstance(k, str) and k.startswith("rx_deductible_")]
+    if not keys:
+        keys = ["rx_deductible_in_network", "rx_deductible_out_of_network"]
+
+    for key in keys:
+        data[key] = None if parsed == "" else parsed
+
+
 def _network_retail_populated(fields: dict[str, str], display: str) -> bool:
     """True when any per-tier retail field for this network has a real cost."""
     return any(fields.get(f"{display} {suffix}") for suffix in _TIER_SUFFIX.values())
@@ -1138,6 +1730,11 @@ async def extract_rx_fields(
 
     def _finalize(structured: dict) -> dict[str, str]:
         _normalize_row_keys(structured)
+        _apply_embedded_specialty_salvage(structured)
+        _apply_embedded_specialty_markdown_salvage(structured, page_markdowns)
+        _apply_aetna_specialty_split_salvage(structured, page_markdowns)
+        _split_merged_tier4_specialty_channel(structured)
+        _apply_rx_deductible_salvage(structured, page_markdowns)
         if category == "health":
             _apply_dual_level_salvage(structured, page_markdowns)
             _apply_level_ab_salvage(structured, page_markdowns)

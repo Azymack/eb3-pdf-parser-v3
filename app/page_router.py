@@ -163,13 +163,22 @@ def select_rx_pages(
         if has_tier_words and any(m in text for m in _RX_COST_MARKERS):
             score += 6.0
         # SBC "Important Questions" row 'Are there other deductibles for
-        # specific services?' often states the prescription drug deductible.
-        if "other deductibles" in text and "prescription" in text:
-            score += 4.0
+        # specific services?' often states the prescription drug deductible
+        # (sometimes as 'medications' / 'Tier 2, 3 & 4' without the word
+        # 'prescription'). Always boost so RX salvage can read it.
+        if "other deductibles" in text:
+            score += 5.0
         scored.append((page_num, score))
 
     scored.sort(key=lambda x: (-x[1], x[0]))
     selected = [pnum for pnum, score in scored[:top_n] if score >= 3.0]
+    # Always keep pages that carry the other-deductibles row — RX deductible
+    # salvage depends on that text even when the pharmacy table is elsewhere.
+    for page in docling_pages:
+        pnum = page["page_number"]
+        text = (page.get("markdown") or "").lower()
+        if "other deductibles" in text and pnum not in selected:
+            selected.append(pnum)
     selected.sort()
 
     logger.info(
