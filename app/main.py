@@ -41,13 +41,13 @@ app = FastAPI(title="eb3-pdf-parser-v3", version="2.0.0")
 _PDF_MAGIC = b"%PDF"
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     """Health check endpoint for monitoring — returns 200 if service is running."""
     return {"status": "healthy", "service": "pdf_parser_v3"}
 
 
-@app.get("/metrics")
+@app.api_route("/metrics", methods=["GET", "HEAD"])
 def metrics():
     """Prometheus metrics endpoint."""
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
