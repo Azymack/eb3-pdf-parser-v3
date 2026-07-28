@@ -44,7 +44,7 @@ _PDF_MAGIC = b"%PDF"
 @app.get("/health")
 def health_check():
     """Health check endpoint for monitoring — returns 200 if service is running."""
-    return {"status": "healthy", "service": "pdf-parser"}
+    return {"status": "healthy", "service": "pdf_parser_v3"}
 
 
 @app.get("/metrics")
