@@ -5,7 +5,8 @@ from typing import Annotated
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .auth import verify_token
 from .config import get_settings
@@ -38,6 +39,18 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="eb3-pdf-parser-v3", version="2.0.0")
 
 _PDF_MAGIC = b"%PDF"
+
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint for monitoring — returns 200 if service is running."""
+    return {"status": "healthy", "service": "pdf-parser"}
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus metrics endpoint."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 def _mirror_ct_into_major_diagnostics(
