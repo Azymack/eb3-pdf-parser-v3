@@ -151,6 +151,8 @@ async def extract_json(
 ):
     settings = get_settings()
 
+    # Frontend may send "Health", "HEALTH", or "critical illness" — normalize.
+    category = category.strip().lower().replace(" ", "_").replace("-", "_")
     if category not in VALID_CATEGORIES:
         raise HTTPException(
             status_code=400,
