@@ -105,7 +105,7 @@ def _nulls_to_empty(fields: dict) -> dict[str, str]:
 
 
 @app.post(
-    "/extract_json_v2",
+    "/extract_json",
     summary="Extract insurance fields from a PDF",
     description=(
         "Extract structured data from an insurance benefit PDF.\n\n"
@@ -132,7 +132,7 @@ def _nulls_to_empty(fields: dict) -> dict[str, str]:
         504: {"description": "Pipeline exceeded timeout"},
     },
 )
-async def extract_json_v2(
+async def extract_json(
     _token: Annotated[str, Depends(verify_token)],
     file: UploadFile = File(..., description="PDF document"),
     category: str = Form(
@@ -183,7 +183,7 @@ async def extract_json_v2(
         )
     except asyncio.TimeoutError:
         logger.error(
-            "extract_json_v2: pipeline exceeded timeout",
+            "extract_json: pipeline exceeded timeout",
             extra={"timeout_seconds": settings.REQUEST_TIMEOUT_SECONDS, "category": category},
         )
         raise HTTPException(

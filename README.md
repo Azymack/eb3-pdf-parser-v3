@@ -5,7 +5,7 @@ Receives a PDF + category, runs it through the full pipeline, and returns struct
 
 ## API
 
-### POST /extract_json_v2
+### POST /extract_json
 
 **Headers**
 
@@ -100,7 +100,7 @@ verifying connectivity and model behaviour without running a full PDF pipeline.
 ## Pipeline stages
 
 ```
-POST /extract_json_v2
+POST /extract_json
   │
   ├─ [1] docling-service  — PDF → per-page markdown + structured data
   ├─ [2] page router      — keyword scoring, select top-N pages
