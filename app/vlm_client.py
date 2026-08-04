@@ -6,11 +6,16 @@ eliminating post-hoc JSON repair.
 System prompt composition
 -------------------------
 Rather than one monolithic prompt for every category, the system prompt is
-assembled from three blocks:
+assembled from layered blocks:
 
-  _BASE_PROMPT                     — universal extraction instructions (all categories)
-  _SINGLE_COLUMN_PROMPT            — in/out-of-network table guidance (dental, vision, health, health_3tier)
-  _HEALTH_FIELD_DEFINITIONS_PROMPT — service-field semantics (health, health_3tier)
+  _BASE_PROMPT                        — universal extraction instructions (all categories)
+  _SINGLE_COLUMN_PROMPT               — in/out-of-network table guidance (dental, vision, health*)
+  _HEALTH_FIELD_DEFINITIONS_PROMPT    — service-field semantics (health, health_3tier)
+  _HEALTH_3TIER_NETWORK_PROMPT        — three provider-level columns (health_3tier)
+  _DENTAL_FIELD_DEFINITIONS_PROMPT    — class-grouped dental tables (dental)
+  _VISION_FIELD_DEFINITIONS_PROMPT    — lens / eyeglasses copay semantics (vision)
+  _DISABILITY_FIELD_DEFINITIONS_PROMPT — benefit formula + elimination period (ltd, std)
+  _LIFE_FIELD_DEFINITIONS_PROMPT      — employee/spouse/child columns (sup_life, term_life)
 
 Prescription drug (RX) fields are NOT extracted here: health and health_3tier
 RX fields are handled by the dedicated structured extraction in rx_extractor.py.
@@ -190,17 +195,117 @@ _DENTAL_FIELD_DEFINITIONS_PROMPT = (
 )
 
 # Block 5 — vision lens field semantics.
+# Testers expect the member's lens / eyeglasses CO-PAY (often $10/$20/$25), not
+# a MATERIALS table cell of $0 that only means "no extra charge beyond that
+# copay". Davis Vision / Aflac-style PDFs print BOTH: CO-PAYMENTS "Eyeglass
+# lenses $10" AND MATERIALS "Clear plastic single-vision… : $0".
 _VISION_FIELD_DEFINITIONS_PROMPT = (
     "\n\nVISION LENS FIELDS: 'Single Vision Lens', 'Lined Bi-Focal Lens', "
-    "'Lined Tri-Focal Lens', and 'Lenticular Lens' are the member cost for the "
-    "STANDARD lens of that type, from the lens MATERIALS row. When one "
-    "materials row prices all standard lens types together — e.g. 'Clear "
-    "plastic single-vision, lined bifocal, trifocal or lenticular lenses (any "
-    "size or Rx): $0' — give ALL of these lens fields that SAME value ('$0'), "
-    "including Single Vision Lens. Do NOT use the separate 'Eyeglass lenses' "
-    "CO-PAYMENT row for any single lens type, and NEVER use lens add-on rows "
-    "(tinting, coatings, polycarbonate, progressive upgrades, "
-    "scratch-protection plans) as the value for these fields."
+    "'Lined Tri-Focal Lens', and 'Lenticular Lens' are the member's "
+    "OUT-OF-POCKET cost for obtaining that STANDARD lens (usually a "
+    "copay). These four fields are ONLY for eyeglass lenses — never copy "
+    "their values into 'Contact Lens Allowance' or 'Frame Allowance'.\n"
+    "PREFERRED SOURCE (use this first):\n"
+    "- An 'Eyeglass lenses' / 'Prescription eyeglasses' / 'Prescription "
+    "glasses' / 'Eyewear' CO-PAYMENT that covers standard lenses, OR\n"
+    "- Wording like '100% after $10 copay', 'covered in full after $20 "
+    "eyewear copay', 'at no additional cost after $25 copay', "
+    "'Included in Prescription Glasses', 'Included in prescription "
+    "eyeglass copay', or 'Eyeglasses (lenses and frame) … $25' that "
+    "covers single vision / lined bifocal / lined trifocal / "
+    "lenticular.\n"
+    "When ONE shared eyeglasses/lens/eyewear / Prescription Glasses "
+    "copay covers all standard lens types, put that SAME copay amount "
+    "in ALL four In-Network lens fields that the document lists under "
+    "that benefit (e.g. '$10' or '$25'). Do this even when individual "
+    "lens-type rows leave the In-Network cell blank and only print "
+    "Out-of-Network 'Up to $…' / 'Amount over: $…' amounts.\n"
+    "'COPAY APPLIES' CELLS (Guardian/VSP benefit summaries): when an "
+    "In-Network cell literally says 'Copay applies' / 'Copay Applies', "
+    "resolve it to the NUMERIC copay from the Co-Pay section of the "
+    "same plan (e.g. 'First Services Provided $0.00', 'Exams $10', "
+    "'Materials $25') — output that amount (e.g. '$0' or '$0.00'), "
+    "NEVER the literal phrase 'Copay applies', and NEVER the "
+    "Out-of-Network 'Amount over: $…' figure (those OON dollars go "
+    "only in Out-of-Network fields).\n"
+    "DO NOT use a MATERIALS / lens-options cell of '$0' for these "
+    "fields when a separate eyeglasses/lens/eyewear CO-PAYMENT also "
+    "exists. That '$0' only means no EXTRA materials charge after the "
+    "lenses copay — the member still pays the lenses copay. Example: "
+    "CO-PAYMENTS 'Eyeglass lenses: $10' + MATERIALS 'Clear plastic "
+    "single-vision, lined bifocal, trifocal or lenticular lenses: $0' "
+    "→ all four lens fields are '$10', NOT '$0'.\n"
+    "Only output '$0' when the document truly states a $0 member cost "
+    "for those lenses (including a $0 co-pay / First Services "
+    "Provided) AND there is no larger lenses/eyeglasses/eyewear "
+    "copay.\n"
+    "EYE EXAM: use the routine exam / WellVision Exam copay only "
+    "(e.g. '$10'). Do NOT append retinal screening amounts such as "
+    "'Up to $39' into Eye Exam.\n"
+    "CONTACT LENS / FRAME ALLOWANCE: use the contact-lens material "
+    "ALLOWANCE (e.g. '$130', '$150', 'Up to $180') and frame "
+    "ALLOWANCE separately. Never fill Contact Lens Allowance with "
+    "the eyeglasses lens copay, exam copay, or contact "
+    "fitting/evaluation copay — a separate 'Contact lenses instead "
+    "of Eyeglasses: $25' COPAY is not the allowance.\n"
+    "NEVER use lens add-on / enhancement rows (tinting, scratch "
+    "coating, polycarbonate upgrades, progressive, UV, AR, "
+    "high-index, polarized, photochromic, scratch-protection plans) "
+    "or the contact-lens fitting row as the value for these four "
+    "standard lens fields."
+)
+
+
+# Block 6 — LTD / STD benefit formula + elimination period.
+_DISABILITY_CATEGORIES: frozenset[str] = frozenset({"ltd", "std"})
+
+_DISABILITY_FIELD_DEFINITIONS_PROMPT = (
+    "\n\nDISABILITY BENEFIT FIELDS:\n"
+    "- 'Monthly Benefit' (LTD) / 'Weekly Benefit' (STD): always combine "
+    "the PERCENTAGE of earnings/salary AND the MAXIMUM dollar amount into "
+    "ONE value. Examples: '60% of monthly earnings up to a maximum of "
+    "$10,000', '60% of monthly earnings $10,000 (Maximum Amount)', "
+    "'60% of salary to maximum $10000/month', '60% of weekly earnings up "
+    "to a maximum of $1,000/week'. NEVER return only the max dollar "
+    "amount (e.g. '$10,000' or '$6,000') when a percentage is also "
+    "stated. Monthly Volume / Coverage amount rows that list "
+    "'60% of monthly earnings' on one line and 'Maximum Amount $10,000' "
+    "on another MUST be joined.\n"
+    "- Do NOT confuse Guarantee Issue / Guaranteed Issue dollar amounts "
+    "(e.g. 'We Guarantee Issue $6000 in coverage') with the Monthly/"
+    "Weekly Benefit — GI is a separate field.\n"
+    "- 'Elimination Period' (aka Waiting Period / When benefits begin): "
+    "when Accident and Illness are listed SEPARATELY on the document, "
+    "format as 'Accident: Day 91 / Illness: Day 91' (or Day 181, etc.). "
+    "Include BOTH even when the day count is the same. If the document "
+    "shows only a single elimination/waiting period (e.g. '90 Days') with "
+    "NO Accident/Illness split, keep that single value — do NOT invent "
+    "Accident/Illness labels.\n"
+    "- 'Disability Definition': use the plan's definition of disability / "
+    "own-occupation vs any-occupation wording — never Evidence of "
+    "Insurability (EOI) / health-statement text."
+)
+
+# Block 7 — supplemental / term life coverage columns.
+_LIFE_CATEGORIES: frozenset[str] = frozenset({"sup_life", "term_life"})
+
+_LIFE_FIELD_DEFINITIONS_PROMPT = (
+    "\n\nLIFE COVERAGE FIELDS:\n"
+    "Voluntary / supplemental life summaries often use a 3-column chart "
+    "(Employee Life Benefits | Spouse Life Benefits | Child Life "
+    "Benefits). Map each column to the matching field; never copy a "
+    "value from one column into another.\n"
+    "- 'Child(ren) Life Insurance Coverage': use the Child Life Benefits "
+    "Benefit Amount / purchase options (e.g. '$2,000, $4,000, or "
+    "$10,000 for children age 14 days or older; $1,000 for children "
+    "under 14 days'). Do NOT use 'Not Applicable' from the Child "
+    "Minimum/Maximum/Age Reductions/Proof of Good Health rows when "
+    "actual child benefit amounts are listed in Benefit Amount.\n"
+    "- 'Employee Life Insurance Coverage' / 'Spouse Life Insurance "
+    "Coverage': include the purchase increments and/or min–max when "
+    "stated (e.g. 'increments of $10,000; $10,000–$300,000').\n"
+    "- 'Age Reduction Schedule': employee/spouse age-reduction wording; "
+    "ignore a Child-column 'Not Applicable' for this field."
 )
 
 
@@ -217,6 +322,10 @@ def _build_system_prompt(category: str, display_category: str) -> str:
         parts.append(_DENTAL_FIELD_DEFINITIONS_PROMPT)
     if category == "vision":
         parts.append(_VISION_FIELD_DEFINITIONS_PROMPT)
+    if category in _DISABILITY_CATEGORIES:
+        parts.append(_DISABILITY_FIELD_DEFINITIONS_PROMPT)
+    if category in _LIFE_CATEGORIES:
+        parts.append(_LIFE_FIELD_DEFINITIONS_PROMPT)
     return "".join(parts)
 
 
