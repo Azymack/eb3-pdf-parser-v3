@@ -44,6 +44,8 @@ class ExtractionResponse(BaseModel):
     processing_time_seconds: float
     stage_timings: StageTimings
     ocr_mode: str  # "auto" or "force" — reflects what was actually sent to docling
+    # True when owner-restricted encryption was stripped so PyMuPDF could render.
+    encryption_stripped: bool = False
 
 
 class LlmTestResponse(BaseModel):

@@ -16,6 +16,50 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
 _IMAGE_BASED_CHARS_PER_PAGE_THRESHOLD = 100
 
 
+def unlock_pdf_if_needed(pdf_bytes: bytes) -> tuple[bytes, bool]:
+    """Rewrite owner-encrypted PDFs without encryption so PyMuPDF can render them.
+
+    Many SBCs ship with AES owner restrictions (copy/print) and an empty user
+    password. PyMuPDF can open them but heap-crashes on get_pixmap for some of
+    these files on Windows — killing the uvicorn worker mid-request.
+
+    Returns ``(bytes, stripped)`` where ``stripped`` is True when encryption was
+    removed. Returns the original bytes (and False) when the PDF is not
+    encrypted or cannot be unlocked with an empty password.
+    """
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if not reader.is_encrypted:
+            return pdf_bytes, False
+
+        # 0 = failed, 1 = user-password match, 2 = owner-password match
+        if reader.decrypt("") == 0:
+            logger.warning(
+                "unlock_pdf_if_needed: encrypted PDF did not accept empty password; "
+                "leaving bytes unchanged"
+            )
+            return pdf_bytes, False
+
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+        out = io.BytesIO()
+        writer.write(out)
+        unlocked = out.getvalue()
+        logger.info(
+            "unlock_pdf_if_needed: stripped owner encryption (%d → %d bytes)",
+            len(pdf_bytes),
+            len(unlocked),
+        )
+        return unlocked, True
+    except Exception:
+        logger.warning(
+            "unlock_pdf_if_needed: failed to rewrite encrypted PDF; using original bytes",
+            exc_info=True,
+        )
+        return pdf_bytes, False
+
+
 def slice_pdf_to_max_pages(pdf_bytes: bytes, max_pages: int) -> tuple[bytes, int, int]:
     """Keep only the first ``max_pages`` pages of a PDF.
 
@@ -28,6 +72,11 @@ def slice_pdf_to_max_pages(pdf_bytes: bytes, max_pages: int) -> tuple[bytes, int
         return pdf_bytes, 0, 0
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
+        if reader.is_encrypted and reader.decrypt("") == 0:
+            logger.warning(
+                "slice_pdf_to_max_pages: encrypted PDF did not accept empty password"
+            )
+            return pdf_bytes, 0, 0
         original_count = len(reader.pages)
         if original_count <= max_pages:
             return pdf_bytes, original_count, original_count

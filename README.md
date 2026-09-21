@@ -59,9 +59,16 @@ Returns the full metadata envelope:
     "page_routing_seconds": 0.001,
     "image_rendering_seconds": 0.4,
     "vlm_extraction_seconds": 3.8
-  }
+  },
+  "ocr_mode": "auto",
+  "encryption_stripped": false
 }
 ```
+
+> **`encryption_stripped`:** `true` when the upload had owner-only AES restrictions
+> (copy/print locks, empty open password) and the pipeline rewrote it without
+> encryption before rendering. Needed because PyMuPDF can crash on some of those
+> files. Normal unencrypted PDFs leave this `false`.
 
 > **Breaking change (v2.1):** Prior to this version the default response was the
 > full metadata envelope. If you were parsing `response["fields"]` from the default

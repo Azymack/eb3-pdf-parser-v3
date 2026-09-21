@@ -10,7 +10,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .auth import verify_token
 from .config import get_settings
-from .docling_client import convert_pdf, slice_pdf_to_max_pages
+from .docling_client import convert_pdf, slice_pdf_to_max_pages, unlock_pdf_if_needed
 from .image_renderer import render_pages
 from .page_router import select_pages, select_rx_pages
 from .post_process import (
@@ -115,14 +115,16 @@ def _nulls_to_empty(fields: dict) -> dict[str, str]:
         "present on the plan).\n\n"
         "**With `?include_metadata=true`**: the full pipeline response is returned, "
         "including `fields`, `low_confidence_fields`, `pages_used`, "
-        "`processing_time_seconds`, and `stage_timings`."
+        "`processing_time_seconds`, `stage_timings`, `ocr_mode`, and "
+        "`encryption_stripped`."
     ),
     responses={
         200: {
             "description": (
                 "Extracted data. Shape depends on `include_metadata`:\n"
                 "- `false` (default): `{\"Field Name\": \"value\", ...}` — flat fields object\n"
-                "- `true`: full metadata wrapper with `fields`, `pages_used`, `stage_timings`, etc."
+                "- `true`: full metadata wrapper with `fields`, `pages_used`, "
+                "`stage_timings`, `ocr_mode`, `encryption_stripped`, etc."
             )
         },
         400: {"description": "Bad request (invalid category, empty file, non-PDF)"},
@@ -144,7 +146,8 @@ async def extract_json(
         description=(
             "When true, wrap the response in a metadata envelope containing "
             "`fields`, `low_confidence_fields`, `pages_used`, "
-            "`processing_time_seconds`, and `stage_timings`. "
+            "`processing_time_seconds`, `stage_timings`, `ocr_mode`, and "
+            "`encryption_stripped`. "
             "Default false returns the fields object directly."
         ),
     ),
@@ -234,6 +237,10 @@ async def _run_pipeline(
 ) -> ExtractionResponse:
     pipeline_start = time.monotonic()
 
+    # Strip owner-only AES encryption before any local PDF work. Restricted
+    # SBCs open without a password but can heap-crash PyMuPDF on render.
+    pdf_bytes, encryption_stripped = unlock_pdf_if_needed(pdf_bytes)
+
     # Cap page count early so docling, OCR, page routing, and image rendering
     # never see more than MAX_PDF_PAGES (default 13). Benefit tables almost
     # always sit in the front of SBCs; trailing pages are mostly legal text.
@@ -286,7 +293,10 @@ async def _run_pipeline(
     logger.info("pipeline[3/4]: image rendering — start")
     t0 = time.monotonic()
     try:
-        rendered_images = render_pages(pdf_bytes, selected_page_numbers)
+        # render_pages is CPU-bound (PyMuPDF rasterization) — run it off the
+        # event loop thread so a slow/pathological PDF can't block this worker
+        # from serving any other request while rendering is in progress.
+        rendered_images = await asyncio.to_thread(render_pages, pdf_bytes, selected_page_numbers)
     except Exception as exc:
         logger.exception("pipeline[3/4]: image rendering failed")
         raise HTTPException(status_code=400, detail=f"Failed to render PDF pages: {exc}")
@@ -316,7 +326,7 @@ async def _run_pipeline(
             rx_images = (
                 rendered_images
                 if rx_page_numbers == selected_page_numbers
-                else render_pages(pdf_bytes, rx_page_numbers)
+                else await asyncio.to_thread(render_pages, pdf_bytes, rx_page_numbers)
             )
         except Exception:
             logger.exception("pipeline[4/4]: RX page rendering failed — "
@@ -408,4 +418,5 @@ async def _run_pipeline(
         processing_time_seconds=round(total_seconds, 3),
         stage_timings=stage_timings,
         ocr_mode=ocr_mode_used,
+        encryption_stripped=encryption_stripped,
     )
